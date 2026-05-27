@@ -1,0 +1,10 @@
+FROM nixos/nix:latest
+
+RUN mkdir /tmp/out /tmp/build
+
+COPY build-base.sh /tmp/build/
+WORKDIR /tmp/build
+VOLUME /tmp/out
+
+ENTRYPOINT ["bash"]
+CMD ["/tmp/build/build-base.sh"]
