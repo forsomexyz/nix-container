@@ -16,6 +16,28 @@ _NIX_CONTAINER_SCRIPT_DIR=$(
 )
 unset _nix_container_src
 
+# Compute a short content hash of the current directory's shell.nix or
+# default.nix. Used to namespace per-project cache volumes.
+_nix_container_project_hash() {
+    local file
+    if [ -f shell.nix ]; then
+        file=shell.nix
+    elif [ -f default.nix ]; then
+        file=default.nix
+    else
+        return 1
+    fi
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$file" | cut -c1-8
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$file" | cut -c1-8
+    else
+        echo "nix-container: no sha256 tool found (need sha256sum or shasum)" >&2
+        return 1
+    fi
+}
+
 # Resolve which container CLI to use. Honors $NIX_CONTAINER_CLI as an override,
 # otherwise auto-detects from a list of docker-CLI-compatible tools.
 _nix_container_cli() {
@@ -73,11 +95,44 @@ nix-container-build() {
 }
 
 nix-container-clear-cache() {
+    local all=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --all)
+                all=1
+                shift
+                ;;
+            *)
+                echo "nix-container-clear-cache: unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
     local cli
     cli=$(_nix_container_cli) || return 1
 
+    local -a volumes=()
+    if [ "$all" -eq 1 ]; then
+        local vol
+        while IFS= read -r vol; do
+            [ -n "$vol" ] && volumes+=("$vol")
+        done < <("$cli" volume ls -q 2>/dev/null | grep -E '^nix-container-(store|cache)-')
+        if [ "${#volumes[@]}" -eq 0 ]; then
+            echo "nix-container-clear-cache: no nix-container caches found"
+            return 0
+        fi
+    else
+        local hash
+        hash=$(_nix_container_project_hash) || {
+            echo "nix-container-clear-cache: no shell.nix or default.nix in current directory (use --all to clear all caches)" >&2
+            return 1
+        }
+        volumes=("nix-container-store-$hash" "nix-container-cache-$hash")
+    fi
+
     local volume
-    for volume in nix-container-store nix-container-cache; do
+    for volume in "${volumes[@]}"; do
         if "$cli" volume inspect "$volume" >/dev/null 2>&1; then
             "$cli" volume rm "$volume" || return 1
         else
@@ -176,11 +231,14 @@ nix-container() {
         fi
     fi
 
+    local hash
+    hash=$(_nix_container_project_hash) || return 1
+
     local dir
     dir=$(basename "$PWD")
     "$cli" run -it --rm "${env_args[@]}" "${mount_args[@]}" \
-        -v nix-container-store:/nix \
-        -v nix-container-cache:/home/nix/.cache \
+        -v "nix-container-store-$hash:/nix" \
+        -v "nix-container-cache-$hash:/home/nix/.cache" \
         -v "$PWD:/home/nix/$dir" \
         -w "/home/nix/$dir" \
         nix-container:latest
