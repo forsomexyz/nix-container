@@ -16,6 +16,27 @@ _NIX_CONTAINER_SCRIPT_DIR=$(
 )
 unset _nix_container_src
 
+# Normalize a docker `-p` spec to always bind the host side to 127.0.0.1, so
+# published ports are never reachable from other machines on the network.
+# Handles: `<container>`, `<host>:<container>`, `<ip>:<host>:<container>`,
+# all optionally suffixed with `/<proto>`.
+_nix_container_force_loopback() {
+    local spec="$1"
+    local proto=""
+    if [[ "$spec" == */* ]]; then
+        proto="/${spec##*/}"
+        spec="${spec%/*}"
+    fi
+
+    local colons="${spec//[^:]/}"
+    case "${#colons}" in
+        0) echo "127.0.0.1::${spec}${proto}" ;;
+        1) echo "127.0.0.1:${spec}${proto}" ;;
+        2) echo "127.0.0.1:${spec#*:}${proto}" ;;
+        *) echo "${spec}${proto}" ;;
+    esac
+}
+
 # Compute a short content hash of the current directory's shell.nix or
 # default.nix. Used to namespace per-project cache volumes.
 _nix_container_project_hash() {
@@ -145,6 +166,7 @@ nix-container() {
     local with_gh_token=0
     local with_aws=0
     local aws_profile=""
+    local -a port_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             --with-gh-token)
@@ -158,6 +180,18 @@ nix-container() {
             --with-aws=*)
                 with_aws=1
                 aws_profile="${1#--with-aws=}"
+                shift
+                ;;
+            -p|--port)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a value (e.g. 8080 or 8080:8080)" >&2
+                    return 1
+                fi
+                port_args+=(-p "$(_nix_container_force_loopback "$2")")
+                shift 2
+                ;;
+            -p=*|--port=*)
+                port_args+=(-p "$(_nix_container_force_loopback "${1#*=}")")
                 shift
                 ;;
             *)
@@ -236,7 +270,7 @@ nix-container() {
 
     local dir
     dir=$(basename "$PWD")
-    "$cli" run -it --rm "${env_args[@]}" "${mount_args[@]}" \
+    "$cli" run -it --rm "${env_args[@]}" "${mount_args[@]}" "${port_args[@]}" \
         -v "nix-container-store-$hash:/nix" \
         -v "nix-container-cache-$hash:/home/nix/.cache" \
         -v "$PWD:/home/nix/$dir" \
