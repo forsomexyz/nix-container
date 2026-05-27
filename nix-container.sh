@@ -203,7 +203,7 @@ nix-container() {
         # Mount the SSO token cache so `aws --profile <sso-profile>` calls inside
         # the container can reuse the host's SSO session instead of re-authenticating.
         if [ -d "$HOME/.aws/sso/cache" ]; then
-            mount_args+=(-v "$HOME/.aws/sso/cache:/home/nix/.aws/sso/cache:ro")
+            mount_args+=(-v "$HOME/.aws/sso/cache:/home/nix/.aws/sso/cache")
         fi
         local -a aws_cmd=(aws)
         if [ -n "$aws_profile" ]; then
