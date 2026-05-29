@@ -291,5 +291,6 @@ nix-container() {
         -v "nix-container-cache-$hash:/home/nix/.cache" \
         -v "$PWD:/home/nix/$dir" \
         -w "/home/nix/$dir" \
-        nix-container:latest
+        nix-container:latest \
+        --extra-experimental-features 'flakes'
 }
