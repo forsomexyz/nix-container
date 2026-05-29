@@ -171,6 +171,7 @@ nix-container-clear-cache() {
 nix-container() {
     local with_gh_token=0
     local with_aws=0
+    local with_npmrc=0
     local aws_profile=""
     local -a port_args=()
     while [ $# -gt 0 ]; do
@@ -186,6 +187,10 @@ nix-container() {
             --with-aws=*)
                 with_aws=1
                 aws_profile="${1#--with-aws=}"
+                shift
+                ;;
+            --with-npmrc)
+                with_npmrc=1
                 shift
                 ;;
             -p|--port)
@@ -231,6 +236,10 @@ nix-container() {
             return 1
         fi
         env_args+=(-e "GH_TOKEN=$token")
+    fi
+
+    if [ "$with_npmrc" -eq 1 ] && [ -f "$HOME/.npmrc" ]; then
+        mount_args+=(-v "$HOME/.npmrc:/home/nix/.npmrc:ro")
     fi
 
     if [ "$with_aws" -eq 1 ]; then
