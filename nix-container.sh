@@ -37,17 +37,23 @@ _nix_container_force_loopback() {
     esac
 }
 
+# Echo the project's nix file (shell.nix or default.nix) in the current
+# directory, or return non-zero if neither exists.
+_nix_container_nix_file() {
+    if [ -f shell.nix ]; then
+        echo shell.nix
+    elif [ -f default.nix ]; then
+        echo default.nix
+    else
+        return 1
+    fi
+}
+
 # Compute a short content hash of the current directory's shell.nix or
 # default.nix. Used to namespace per-project cache volumes.
 _nix_container_project_hash() {
     local file
-    if [ -f shell.nix ]; then
-        file=shell.nix
-    elif [ -f default.nix ]; then
-        file=default.nix
-    else
-        return 1
-    fi
+    file=$(_nix_container_nix_file) || return 1
 
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$file" | cut -c1-8
@@ -201,10 +207,11 @@ nix-container() {
         esac
     done
 
-    if [ ! -f shell.nix ] && [ ! -f default.nix ]; then
+    local nix_file
+    nix_file=$(_nix_container_nix_file) || {
         echo "nix-container: no shell.nix or default.nix in current directory" >&2
         return 1
-    fi
+    }
 
     local cli
     cli=$(_nix_container_cli) || return 1
