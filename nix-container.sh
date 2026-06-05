@@ -1,3 +1,5 @@
+# This file is meant to be sourced from a bash or zsh shell rc, not executed.
+# shellcheck shell=bash
 if [ -n "${BASH_VERSION:-}" ]; then
     _nix_container_src="${BASH_SOURCE[0]}"
 elif [ -n "${ZSH_VERSION:-}" ]; then
@@ -122,8 +124,13 @@ nix-container-build() {
     out=$(mktemp -d) || return 1
     "$cli" run --rm -v "$out:/tmp/out" nix-container-base-build:latest || { rm -rf "$out"; return 1; }
 
-    local tarball
-    tarball=$(ls "$out"/*.tar.gz 2>/dev/null | head -n 1)
+    local tarball=""
+    local f
+    while IFS= read -r f; do
+        if [ -z "$tarball" ] || [ "$f" -nt "$tarball" ]; then
+            tarball=$f
+        fi
+    done < <(find "$out" -maxdepth 1 -name '*.tar.gz' 2>/dev/null)
     if [ -z "$tarball" ]; then
         echo "nix-container-build: no tarball produced in $out" >&2
         rm -rf "$out"
@@ -250,8 +257,7 @@ nix-container() {
         esac
     done
 
-    local nix_file
-    nix_file=$(_nix_container_nix_file) || {
+    _nix_container_nix_file >/dev/null || {
         echo "nix-container: no shell.nix or default.nix in current directory" >&2
         return 1
     }

@@ -2,7 +2,7 @@
 #
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
-pushd $SCRIPT_DIR > /dev/null
+pushd "$SCRIPT_DIR" > /dev/null || exit 1
 nix-build -E '
 let
   pkgs = import <nixpkgs> {};
@@ -20,5 +20,5 @@ in
     gid = 502;
   }
 '
-cp $(readlink -e result) /tmp/out/
-popd > /dev/null
+cp "$(readlink -e result)" /tmp/out/
+popd > /dev/null || exit 1
