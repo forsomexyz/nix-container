@@ -11,4 +11,6 @@ RUN mkdir -p /home/nix/.cache
 # from writing its own cache (e.g. /home/nix/.aws/cli).
 RUN mkdir -p /home/nix/.aws/sso
 
+ENV LC_ALL=C.UTF-8
+
 ENTRYPOINT ["nix-shell"]
