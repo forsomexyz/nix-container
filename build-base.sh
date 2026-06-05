@@ -18,8 +18,6 @@ in
 
     uid = 502;
     gid = 502;
-
-    extraPkgs = [ pkgs.direnv pkgs.nix-direnv ];
   }
 '
 cp $(readlink -e result) /tmp/out/
