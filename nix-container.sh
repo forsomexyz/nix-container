@@ -96,10 +96,27 @@ nix-container-build() {
         return 1
     fi
 
+    local -a build_args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-cache)
+                build_args+=(--no-cache)
+                shift
+                ;;
+            *)
+                echo "nix-container-build: unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
     local cli
     cli=$(_nix_container_cli) || return 1
 
-    "$cli" build -t nix-container-base-build:latest -f "$dir/Dockerfile.base-build" "$dir" || return 1
+    local prev_base_id
+    prev_base_id=$("$cli" image inspect --format '{{.Id}}' nix-container-base:latest 2>/dev/null)
+
+    "$cli" build "${build_args[@]}" -t nix-container-base-build:latest -f "$dir/Dockerfile.base-build" "$dir" || return 1
 
     local out
     out=$(mktemp -d) || return 1
@@ -118,7 +135,28 @@ nix-container-build() {
 
     rm -rf "$out"
 
-    "$cli" build -t nix-container:latest -f "$dir/Dockerfile" "$dir" || return 1
+    "$cli" build "${build_args[@]}" -t nix-container:latest -f "$dir/Dockerfile" "$dir" || return 1
+
+    local new_base_id
+    new_base_id=$("$cli" image inspect --format '{{.Id}}' nix-container-base:latest 2>/dev/null)
+
+    # The /nix store and ~/.cache named volumes are populated from the image on
+    # first use only; if the base image changed, existing volumes hold stale
+    # store paths that no longer exist in the new image. Drop them so the next
+    # `nix-container` run repopulates from the fresh image.
+    if [ -n "$new_base_id" ] && [ "$prev_base_id" != "$new_base_id" ]; then
+        local -a stale_volumes=()
+        local vol
+        while IFS= read -r vol; do
+            [ -n "$vol" ] && stale_volumes+=("$vol")
+        done < <("$cli" volume ls -q 2>/dev/null | grep -E '^nix-container-(store|cache)-')
+        if [ "${#stale_volumes[@]}" -gt 0 ]; then
+            echo "nix-container-build: base image changed, invalidating ${#stale_volumes[@]} cache volume(s)"
+            for vol in "${stale_volumes[@]}"; do
+                "$cli" volume rm "$vol" >/dev/null || return 1
+            done
+        fi
+    fi
 }
 
 nix-container-clear-cache() {
