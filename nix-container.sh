@@ -122,7 +122,11 @@ nix-container-build() {
 
     local out
     out=$(mktemp -d) || return 1
-    "$cli" run --rm -v "$out:/tmp/out" nix-container-base-build:latest || { rm -rf "$out"; return 1; }
+    "$cli" run --rm \
+        -e "HOST_UID=$(id -u)" \
+        -e "HOST_GID=$(id -g)" \
+        -v "$out:/tmp/out" \
+        nix-container-base-build:latest || { rm -rf "$out"; return 1; }
 
     local tarball=""
     local f
