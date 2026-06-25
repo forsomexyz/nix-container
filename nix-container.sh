@@ -164,7 +164,9 @@ nix-container-build() {
         if [ "${#stale_volumes[@]}" -gt 0 ]; then
             echo "nix-container-build: base image changed, invalidating ${#stale_volumes[@]} cache volume(s)"
             for vol in "${stale_volumes[@]}"; do
-                "$cli" volume rm "$vol" >/dev/null || return 1
+                if ! "$cli" volume rm "$vol" >/dev/null 2>&1; then
+                    echo "nix-container-build: could not remove $vol (still in use? stop running containers and rerun nix-container-clear-cache --all)" >&2
+                fi
             done
         fi
     fi
@@ -334,11 +336,47 @@ nix-container() {
 
     local dir
     dir=$(basename "$PWD")
-    "$cli" run -it --rm "${env_args[@]}" "${mount_args[@]}" "${port_args[@]}" \
-        -v "nix-container-store-$hash:/nix" \
-        -v "nix-container-cache-$hash:/home/nix/.cache" \
-        -v "$PWD:/home/nix/$dir" \
-        -w "/home/nix/$dir" \
-        nix-container:latest \
-        --extra-experimental-features 'flakes'
+
+    local -a run_args=(
+        --rm
+        "${env_args[@]}"
+        "${mount_args[@]}"
+        "${port_args[@]}"
+        -v "nix-container-store-$hash:/nix"
+        -v "nix-container-cache-$hash:/home/nix/.cache"
+        -v "$PWD:/home/nix/$dir"
+        -w "/home/nix/$dir"
+        nix-container:latest
+        --extra-experimental-features flakes
+    )
+
+    local start=$SECONDS
+    "$cli" run -it "${run_args[@]}"
+    local rc=$?
+
+    # If the container exited quickly with an error, it likely failed during
+    # nix-shell startup. The most common cause is a stale /nix volume that was
+    # populated by a previous (now-rebuilt) base image. Probe non-interactively
+    # to confirm, and if so, drop the project's cache volumes and retry once.
+    if [ $rc -ne 0 ] && [ $((SECONDS - start)) -lt 3 ]; then
+        local probe
+        probe=$("$cli" run "${run_args[@]}" --run true 2>&1)
+        if echo "$probe" | grep -q "cannot determine user's home directory"; then
+            echo "nix-container: stale cache detected for this project, clearing and retrying..." >&2
+            local stuck=0
+            local vol
+            for vol in "nix-container-store-$hash" "nix-container-cache-$hash"; do
+                "$cli" volume inspect "$vol" >/dev/null 2>&1 || continue
+                "$cli" volume rm "$vol" >/dev/null 2>&1 || stuck=1
+            done
+            if [ "$stuck" -eq 1 ]; then
+                echo "nix-container: cannot clear cache while other nix-container sessions are open for this project. Exit those sessions and re-run." >&2
+                return $rc
+            fi
+            "$cli" run -it "${run_args[@]}"
+            return $?
+        fi
+    fi
+
+    return $rc
 }
