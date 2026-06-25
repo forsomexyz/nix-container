@@ -101,6 +101,18 @@ nix-container-build() {
     local -a build_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: nix-container-build [options]
+
+Build the nix-container base and runtime images.
+
+Options:
+  --no-cache    Build images without using the container build cache.
+  -h, --help    Show this help message.
+EOF
+                return 0
+                ;;
             --no-cache)
                 build_args+=(--no-cache)
                 shift
@@ -176,6 +188,19 @@ nix-container-clear-cache() {
     local all=0
     while [ $# -gt 0 ]; do
         case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: nix-container-clear-cache [options]
+
+Remove cache volumes used by nix-container. By default removes only the
+volumes for the current project (based on shell.nix or default.nix).
+
+Options:
+  --all         Remove cache volumes for all nix-container projects.
+  -h, --help    Show this help message.
+EOF
+                return 0
+                ;;
             --all)
                 all=1
                 shift
@@ -227,6 +252,25 @@ nix-container() {
     local -a port_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: nix-container [options]
+
+Run a containerized nix-shell for the shell.nix or default.nix in the
+current directory.
+
+Options:
+  --with-gh-token       Forward a GitHub token from 'gh auth token' as GH_TOKEN.
+  --with-aws            Forward AWS credentials from the host (uses default profile).
+  --with-aws=PROFILE    Forward AWS credentials using the given profile.
+  --with-npmrc          Mount ~/.npmrc into the container (read-only) if present.
+  -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
+                        SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
+                        optionally suffixed with /<proto>.
+  -h, --help            Show this help message.
+EOF
+                return 0
+                ;;
             --with-gh-token)
                 with_gh_token=1
                 shift
