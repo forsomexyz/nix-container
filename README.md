@@ -38,6 +38,17 @@ This produces three images:
 - `nix-container-base:latest` — base image with Nix, direnv, nix-direnv.
 - `nix-container:latest` — the image used at runtime.
 
+## Getting started
+
+To scaffold a bare-bones `shell.nix` (no packages, empty shell hook) in the
+current directory:
+
+```sh
+nix-container-init
+```
+
+Edit the generated `shell.nix` to add packages, then run `nix-container`.
+
 ## Usage
 
 From any directory containing a `shell.nix` or `default.nix`:

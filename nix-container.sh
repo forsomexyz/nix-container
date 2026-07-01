@@ -91,6 +91,56 @@ _nix_container_cli() {
     return 1
 }
 
+nix-container-init() {
+    local force=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                cat <<'EOF'
+Usage: nix-container-init [options]
+
+Create a bare-bones shell.nix in the current directory to get started.
+The generated file has no packages and an empty shell hook.
+
+Options:
+  --force       Overwrite an existing shell.nix.
+  -h, --help    Show this help message.
+EOF
+                return 0
+                ;;
+            --force)
+                force=1
+                shift
+                ;;
+            *)
+                echo "nix-container-init: unknown option: $1" >&2
+                return 1
+                ;;
+        esac
+    done
+
+    if [ -f shell.nix ] && [ "$force" -ne 1 ]; then
+        echo "nix-container-init: shell.nix already exists (use --force to overwrite)" >&2
+        return 1
+    fi
+
+    cat > shell.nix <<'EOF'
+let pkgs = import <nixpkgs> {};
+in
+pkgs.mkShellNoCC {
+  packages = with pkgs; [ ];
+  shellHook = ''
+    # Sane defaults for unicode and truecolor terminal support.
+    export LANG=C.UTF-8        # use a UTF-8 locale for unicode handling
+    export LC_ALL=C.UTF-8      # override any inherited locale categories
+    export COLORTERM=truecolor # advertise 24-bit color support to programs
+  '';
+}
+EOF
+
+    echo "nix-container-init: created shell.nix"
+}
+
 nix-container-build() {
     local dir="$_NIX_CONTAINER_SCRIPT_DIR"
     if [ -z "$dir" ]; then
