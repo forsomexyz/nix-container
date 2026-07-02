@@ -32,7 +32,7 @@ _nix_container_force_loopback() {
 
     local colons="${spec//[^:]/}"
     case "${#colons}" in
-        0) echo "127.0.0.1::${spec}${proto}" ;;
+        0) echo "127.0.0.1:${spec}:${spec}${proto}" ;;
         1) echo "127.0.0.1:${spec}${proto}" ;;
         2) echo "127.0.0.1:${spec#*:}${proto}" ;;
         *) echo "${spec}${proto}" ;;
