@@ -542,6 +542,7 @@ EOF
 
     local -a run_args=(
         --rm
+        --name "$dir"
         "${cli_run_args[@]}"
         "${env_args[@]}"
         "${mount_args[@]}"
