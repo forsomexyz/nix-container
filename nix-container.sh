@@ -91,6 +91,74 @@ _nix_container_cli() {
     return 1
 }
 
+# Classify the resolved CLI. Apple's `container` needs different handling from
+# docker-compatible CLIs in a few places (image inspection format, volume
+# seeding, preflight checks); everything else is treated as docker-compatible.
+_nix_container_cli_kind() {
+    case "$(basename "$1")" in
+        container) echo container ;;
+        *) echo docker ;;
+    esac
+}
+
+# Echo a stable image id for the given image, or empty if it doesn't exist.
+# Used to detect whether the base image changed across a rebuild. docker
+# supports Go-template formatting; `container` only emits JSON, so parse it.
+_nix_container_image_id() {
+    local cli="$1" image="$2"
+    if [ "$(_nix_container_cli_kind "$cli")" = container ]; then
+        "$cli" image inspect "$image" 2>/dev/null | jq -r '.[0].id // empty'
+    else
+        "$cli" image inspect --format '{{.Id}}' "$image" 2>/dev/null
+    fi
+}
+
+# Verify the `container` backend is usable before we try to run anything. No-op
+# for docker-compatible CLIs. Checks: jq present (needed to parse JSON output),
+# the container service is running, and a guest kernel is configured.
+_nix_container_preflight() {
+    local cli="$1"
+    [ "$(_nix_container_cli_kind "$cli")" = container ] || return 0
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "nix-container: the 'container' backend requires 'jq' in PATH" >&2
+        return 1
+    fi
+
+    local svc_status
+    svc_status=$("$cli" system status --format json 2>/dev/null | jq -r '.status // empty')
+    if [ "$svc_status" != "running" ]; then
+        echo "nix-container: container service not running — run 'container system start'" >&2
+        return 1
+    fi
+
+    if ! "$cli" system property list --format json 2>/dev/null \
+            | jq -e '.kernel.binaryPath // empty' >/dev/null; then
+        echo "nix-container: no guest kernel configured — run 'container system kernel set --recommended'" >&2
+        return 1
+    fi
+}
+
+# Prepare a project's cache volumes for the `container` backend. Docker
+# auto-populates a fresh named volume from the image's contents at the mount
+# path and inherits the image's ownership; Apple's `container` mounts an empty,
+# root-owned filesystem instead. Two problems follow:
+#   - An empty /nix would hide the entire Nix installation and break startup, so
+#     seed it from the image (mounted at a staging path where the image's own
+#     /nix is still visible). Idempotent: only copies when the volume is empty.
+#   - A root-owned ~/.cache can't be written by the (non-root) run user, so nix
+#     can't write its binary-cache database and silently rebuilds everything
+#     from source. chown it to the run user.
+# Runs as root so it can write both volumes regardless of their current owner.
+_nix_container_prepare_volumes() {
+    local cli="$1" store_vol="$2" cache_vol="$3" owner="$4"
+    "$cli" run --rm --user 0 --entrypoint sh \
+        -v "$store_vol:/seed-nix" \
+        -v "$cache_vol:/seed-cache" \
+        nix-container:latest \
+        -c "[ -e /seed-nix/store ] || cp -a /nix/. /seed-nix/; chown $owner /seed-cache"
+}
+
 nix-container-init() {
     local force=0
     while [ $# -gt 0 ]; do
@@ -176,9 +244,22 @@ EOF
 
     local cli
     cli=$(_nix_container_cli) || return 1
+    _nix_container_preflight "$cli" || return 1
+
+    # `container` only loads OCI archives; docker loads the docker-archive that
+    # docker.nix produces. build-base.sh emits the format we ask for here.
+    local kind image_format artifact_glob
+    kind=$(_nix_container_cli_kind "$cli")
+    if [ "$kind" = container ]; then
+        image_format=oci
+        artifact_glob='*-oci.tar'
+    else
+        image_format=docker
+        artifact_glob='*.tar.gz'
+    fi
 
     local prev_base_id
-    prev_base_id=$("$cli" image inspect --format '{{.Id}}' nix-container-base:latest 2>/dev/null)
+    prev_base_id=$(_nix_container_image_id "$cli" nix-container-base:latest)
 
     "$cli" build "${build_args[@]}" -t nix-container-base-build:latest -f "$dir/Dockerfile.base-build" "$dir" || return 1
 
@@ -187,6 +268,7 @@ EOF
     "$cli" run --rm \
         -e "HOST_UID=$(id -u)" \
         -e "HOST_GID=$(id -g)" \
+        -e "IMAGE_FORMAT=$image_format" \
         -v "$out:/tmp/out" \
         nix-container-base-build:latest || { rm -rf "$out"; return 1; }
 
@@ -196,22 +278,21 @@ EOF
         if [ -z "$tarball" ] || [ "$f" -nt "$tarball" ]; then
             tarball=$f
         fi
-    done < <(find "$out" -maxdepth 1 -name '*.tar.gz' 2>/dev/null)
+    done < <(find "$out" -maxdepth 1 -name "$artifact_glob" 2>/dev/null)
     if [ -z "$tarball" ]; then
-        echo "nix-container-build: no tarball produced in $out" >&2
+        echo "nix-container-build: no image artifact ($artifact_glob) produced in $out" >&2
         rm -rf "$out"
         return 1
     fi
 
-    "$cli" load -i "$tarball" || { rm -rf "$out"; return 1; }
-    "$cli" tag nix-container-base:latest nix-container-base:latest 2>/dev/null
+    "$cli" image load -i "$tarball" || { rm -rf "$out"; return 1; }
 
     rm -rf "$out"
 
     "$cli" build "${build_args[@]}" -t nix-container:latest -f "$dir/Dockerfile" "$dir" || return 1
 
     local new_base_id
-    new_base_id=$("$cli" image inspect --format '{{.Id}}' nix-container-base:latest 2>/dev/null)
+    new_base_id=$(_nix_container_image_id "$cli" nix-container-base:latest)
 
     # The /nix store and ~/.cache named volumes are populated from the image on
     # first use only; if the base image changed, existing volumes hold stale
@@ -222,7 +303,7 @@ EOF
         local vol
         while IFS= read -r vol; do
             [ -n "$vol" ] && stale_volumes+=("$vol")
-        done < <("$cli" volume ls -q 2>/dev/null | grep -E '^nix-container-(store|cache)-')
+        done < <("$cli" volume ls --quiet 2>/dev/null | grep -E '^nix-container-(store|cache)-')
         if [ "${#stale_volumes[@]}" -gt 0 ]; then
             echo "nix-container-build: base image changed, invalidating ${#stale_volumes[@]} cache volume(s)"
             for vol in "${stale_volumes[@]}"; do
@@ -270,7 +351,7 @@ EOF
         local vol
         while IFS= read -r vol; do
             [ -n "$vol" ] && volumes+=("$vol")
-        done < <("$cli" volume ls -q 2>/dev/null | grep -E '^nix-container-(store|cache)-')
+        done < <("$cli" volume ls --quiet 2>/dev/null | grep -E '^nix-container-(store|cache)-')
         if [ "${#volumes[@]}" -eq 0 ]; then
             echo "nix-container-clear-cache: no nix-container caches found"
             return 0
@@ -364,6 +445,7 @@ EOF
 
     local cli
     cli=$(_nix_container_cli) || return 1
+    _nix_container_preflight "$cli" || return 1
 
     if ! "$cli" image inspect nix-container:latest >/dev/null 2>&1; then
         echo "nix-container: image nix-container:latest not found. Run 'nix-container-build' to build it." >&2
@@ -428,11 +510,39 @@ EOF
     local hash
     hash=$(_nix_container_project_hash) || return 1
 
+    local kind
+    kind=$(_nix_container_cli_kind "$cli")
+
+    # Apple's `container` needs extra run flags that docker doesn't:
+    #   --user  the image's `USER nix` (a name) fails to start on `container`;
+    #           a numeric uid:gid works, and since the base is built with the
+    #           host uid/gid it maps exactly to the nix user (so files created
+    #           in the bind-mounted project dir are owned by the host user too).
+    #   HOME    ensure it's set when running by numeric uid.
+    local -a cli_run_args=()
+    if [ "$kind" = container ]; then
+        cli_run_args=(--user "$(id -u):$(id -g)" -e "HOME=/home/nix")
+
+        # Docker seeds/owns fresh volumes from the image automatically;
+        # `container` does not, so prepare them the first time this project's
+        # volumes are created (seed /nix, chown ~/.cache). Once the store volume
+        # exists it's already prepared, so skip the (VM-starting) step after.
+        local store_vol="nix-container-store-$hash"
+        if ! "$cli" volume inspect "$store_vol" >/dev/null 2>&1; then
+            _nix_container_prepare_volumes "$cli" "$store_vol" \
+                "nix-container-cache-$hash" "$(id -u):$(id -g)" || {
+                echo "nix-container: failed to prepare the /nix and cache volumes" >&2
+                return 1
+            }
+        fi
+    fi
+
     local dir
     dir=$(basename "$PWD")
 
     local -a run_args=(
         --rm
+        "${cli_run_args[@]}"
         "${env_args[@]}"
         "${mount_args[@]}"
         "${port_args[@]}"

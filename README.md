@@ -14,7 +14,11 @@ Nix on the host.
 
 ## Requirements
 
-- A docker-CLI-compatible container runtime in `PATH`: `docker` or `container`.
+- A container runtime in `PATH`: `docker` or Apple's `container`.
+- For the `container` backend: `jq` in `PATH` (ships with recent macOS), the
+  service running (`container system start`), and a guest kernel configured
+  (`container system kernel set --recommended`). See [Using Apple's
+  `container`](#using-apples-container).
 - For `--with-gh-token`: the `gh` CLI, authenticated.
 - For `--with-aws`: the `aws` CLI (v2.13+ for `configure export-credentials`).
 
@@ -78,6 +82,32 @@ Auto-detection prefers `docker`, then falls back to `container`. To force one:
 ```sh
 NIX_CONTAINER_CLI=container nix-container
 ```
+
+### Using Apple's `container`
+
+The [`container`](https://github.com/apple/container) CLI is supported as an
+alternative to `docker`. It behaves differently from Docker in two ways that
+nix-container handles automatically, plus some one-time host setup:
+
+One-time setup:
+
+```sh
+container system start                             # start the service
+container system kernel set --recommended          # install a guest kernel
+```
+
+`nix-container` and `nix-container-build` preflight both of these (and the
+presence of `jq`) and print the exact command to run if something is missing.
+
+What nix-container does for you:
+
+- **Image format.** `container` only loads OCI archives, while Nix's `docker.nix`
+  produces a docker-archive. `nix-container-build` converts the base image with
+  `skopeo` (pulled in via Nix during the build) when building for `container`.
+- **Store seeding.** Docker populates a fresh named volume from the image's
+  contents on first mount; `container` mounts an empty filesystem instead. Since
+  the entire Nix installation lives under `/nix`, `nix-container` seeds a new
+  project's `/nix` store volume from the image on first run (a one-time copy).
 
 ### Clearing caches
 
