@@ -152,6 +152,11 @@ _nix_container_preflight() {
 # Runs as root so it can write both volumes regardless of their current owner.
 _nix_container_prepare_volumes() {
     local cli="$1" store_vol="$2" cache_vol="$3" owner="$4"
+    # Create the volumes explicitly first so the seeding run below reuses them
+    # instead of auto-creating them, which prints a "named volume was
+    # automatically created" note we don't want.
+    "$cli" volume create "$store_vol" >/dev/null 2>&1
+    "$cli" volume create "$cache_vol" >/dev/null 2>&1
     "$cli" run --rm --user 0 --entrypoint sh \
         -v "$store_vol:/seed-nix" \
         -v "$cache_vol:/seed-cache" \
