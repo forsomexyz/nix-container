@@ -21,6 +21,7 @@ Nix on the host.
   `container`](#using-apples-container).
 - For `--with-gh-token`: the `gh` CLI, authenticated.
 - For `--with-aws`: the `aws` CLI (v2.13+ for `configure export-credentials`).
+- For `--with-env` with 1Password references: the `op` CLI, signed in.
 
 ## Setup
 
@@ -73,6 +74,7 @@ container drops you into the project's resolved environment.
 | `--with-aws`               | Export resolved AWS credentials as env vars and read-only mount `~/.aws/config` and SSO cache.  |
 | `--with-aws=<profile>`     | Same as `--with-aws`, but resolves credentials from the given profile (sets `AWS_PROFILE` too). |
 | `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
+| `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 
 ### Picking a specific container CLI
@@ -151,3 +153,34 @@ environment variables. It also mounts:
   read profile definitions.
 - `~/.aws/sso/cache` — so SSO-based profiles can reuse the host's existing
   SSO session token instead of re-authenticating.
+
+## Environment files & secrets
+
+`--with-env <file>` loads environment variables from a dotenv-style file
+(`KEY=value` lines, `#` comments and blank lines ignored). It takes one of two
+paths depending on the file's contents:
+
+- **Plain values** — the file is handed straight to the container CLI's
+  `--env-file`, and no extra tooling is required.
+- **1Password secret references** — if any value is a
+  [secret reference](https://developer.1password.com/docs/cli/secret-references/)
+  (`op://<vault>/<item>/<field>`), the whole run is wrapped in `op run`, which
+  resolves the references at launch time. Each variable is then forwarded into
+  the container *by name*, so resolved secret values never appear in the process
+  argument list (e.g. `ps`). This requires the `op` CLI in `PATH` and signed in;
+  `nix-container` errors out if references are present but `op` is missing.
+
+Example `.env` file mixing literals and secret references:
+
+```sh
+LOG_LEVEL=debug
+DATABASE_URL=op://Dev/postgres/connection_string
+API_KEY=op://Dev/api/key
+```
+
+```sh
+nix-container --with-env .env
+```
+
+The first time a secret reference is resolved, `op` may prompt you to unlock
+(e.g. via biometrics), then reuses the session for the rest of the run.

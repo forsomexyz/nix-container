@@ -384,6 +384,8 @@ nix-container() {
     local with_gh_token=0
     local with_aws=0
     local with_npmrc=0
+    local with_env=0
+    local env_file=""
     local aws_profile=""
     local -a port_args=()
     while [ $# -gt 0 ]; do
@@ -400,6 +402,11 @@ Options:
   --with-aws            Forward AWS credentials from the host (uses default profile).
   --with-aws=PROFILE    Forward AWS credentials using the given profile.
   --with-npmrc          Mount ~/.npmrc into the container (read-only) if present.
+  --with-env FILE       Load environment variables from FILE (dotenv format).
+                        If FILE contains 1Password secret references (op://...),
+                        they are resolved at run time with the 'op' CLI (which
+                        must be in PATH); otherwise FILE is passed straight to
+                        the container CLI's --env-file.
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
@@ -422,6 +429,20 @@ EOF
                 ;;
             --with-npmrc)
                 with_npmrc=1
+                shift
+                ;;
+            --with-env)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a file argument" >&2
+                    return 1
+                fi
+                with_env=1
+                env_file="$2"
+                shift 2
+                ;;
+            --with-env=*)
+                with_env=1
+                env_file="${1#--with-env=}"
                 shift
                 ;;
             -p|--port)
@@ -512,6 +533,43 @@ EOF
         fi
     fi
 
+    # Wrap the container invocation in `op run` only when the env file actually
+    # carries 1Password secret references; empty otherwise so the run is direct.
+    local -a op_prefix=()
+    if [ "$with_env" -eq 1 ]; then
+        if [ ! -f "$env_file" ]; then
+            echo "nix-container: --with-env: file not found: $env_file" >&2
+            return 1
+        fi
+        # If the file contains 1Password secret references (op://...), resolve
+        # them at run time by wrapping the container invocation in `op run`,
+        # which sets the resolved values in the CLI's environment; each variable
+        # is then forwarded into the container by name (-e NAME), so resolved
+        # secrets never appear in the process argument list. A file without
+        # references is handed to the CLI's own --env-file, no op required.
+        if grep -q 'op://' "$env_file"; then
+            if ! command -v op >/dev/null 2>&1; then
+                echo "nix-container: --with-env: $env_file has 1Password secret references (op://) but the 'op' CLI is not in PATH" >&2
+                return 1
+            fi
+            local line name
+            while IFS= read -r line; do
+                case "$line" in
+                    ''|\#*) continue ;;
+                esac
+                line="${line#export }"
+                case "$line" in
+                    *=*) name="${line%%=*}" ;;
+                    *) continue ;;
+                esac
+                env_args+=(-e "$name")
+            done < "$env_file"
+            op_prefix=(op run --no-masking "--env-file=$env_file" --)
+        else
+            env_args+=(--env-file "$env_file")
+        fi
+    fi
+
     local hash
     hash=$(_nix_container_project_hash) || return 1
 
@@ -561,7 +619,7 @@ EOF
     )
 
     local start=$SECONDS
-    "$cli" run -it "${run_args[@]}"
+    "${op_prefix[@]}" "$cli" run -it "${run_args[@]}"
     local rc=$?
 
     # If the container exited quickly with an error, it likely failed during
@@ -570,7 +628,7 @@ EOF
     # to confirm, and if so, drop the project's cache volumes and retry once.
     if [ $rc -ne 0 ] && [ $((SECONDS - start)) -lt 3 ]; then
         local probe
-        probe=$("$cli" run "${run_args[@]}" --run true 2>&1)
+        probe=$("${op_prefix[@]}" "$cli" run "${run_args[@]}" --run true 2>&1)
         if echo "$probe" | grep -q "cannot determine user's home directory"; then
             echo "nix-container: stale cache detected for this project, clearing and retrying..." >&2
             local stuck=0
@@ -583,7 +641,7 @@ EOF
                 echo "nix-container: cannot clear cache while other nix-container sessions are open for this project. Exit those sessions and re-run." >&2
                 return $rc
             fi
-            "$cli" run -it "${run_args[@]}"
+            "${op_prefix[@]}" "$cli" run -it "${run_args[@]}"
             return $?
         fi
     fi
