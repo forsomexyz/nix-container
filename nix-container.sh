@@ -387,15 +387,22 @@ nix-container() {
     local with_env=0
     local env_file=""
     local aws_profile=""
+    local do_run=0
+    local -a run_cmd=()
     local -a port_args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help)
                 cat <<'EOF'
 Usage: nix-container [options]
+       nix-container [options] run COMMAND [ARG...]
 
 Run a containerized nix-shell for the shell.nix or default.nix in the
 current directory.
+
+With `run`, COMMAND is executed inside the project's nix-shell environment
+and the container exits, instead of opening an interactive shell. Everything
+after `run` is treated as the command, so options must come before it.
 
 Options:
   --with-gh-token       Forward a GitHub token from 'gh auth token' as GH_TOKEN.
@@ -457,12 +464,23 @@ EOF
                 port_args+=(-p "$(_nix_container_force_loopback "${1#*=}")")
                 shift
                 ;;
+            run)
+                do_run=1
+                shift
+                run_cmd=("$@")
+                break
+                ;;
             *)
                 echo "nix-container: unknown option: $1" >&2
                 return 1
                 ;;
         esac
     done
+
+    if [ "$do_run" -eq 1 ] && [ "${#run_cmd[@]}" -eq 0 ]; then
+        echo "nix-container: run requires a command (e.g. nix-container run npm test)" >&2
+        return 1
+    fi
 
     _nix_container_nix_file >/dev/null || {
         echo "nix-container: no shell.nix or default.nix in current directory" >&2
@@ -618,8 +636,23 @@ EOF
         --extra-experimental-features flakes
     )
 
+    # Default is an interactive shell (-it). With `run`, execute the command
+    # non-interactively via nix-shell's --run and exit; only allocate a TTY when
+    # our own std streams are terminals so output stays pipeable in scripts/CI.
+    local -a it_args=(-it)
+    if [ "$do_run" -eq 1 ]; then
+        local quoted_cmd="" arg
+        for arg in "${run_cmd[@]}"; do
+            quoted_cmd+="$(printf '%q ' "$arg")"
+        done
+        run_args+=(--run "$quoted_cmd")
+        it_args=()
+        [ -t 0 ] && it_args+=(-i)
+        [ -t 1 ] && it_args+=(-t)
+    fi
+
     local start=$SECONDS
-    "${op_prefix[@]}" "$cli" run -it "${run_args[@]}"
+    "${op_prefix[@]}" "$cli" run "${it_args[@]}" "${run_args[@]}"
     local rc=$?
 
     # If the container exited quickly with an error, it likely failed during
@@ -641,7 +674,7 @@ EOF
                 echo "nix-container: cannot clear cache while other nix-container sessions are open for this project. Exit those sessions and re-run." >&2
                 return $rc
             fi
-            "${op_prefix[@]}" "$cli" run -it "${run_args[@]}"
+            "${op_prefix[@]}" "$cli" run "${it_args[@]}" "${run_args[@]}"
             return $?
         fi
     fi

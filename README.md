@@ -66,6 +66,31 @@ The current directory is bind-mounted to `/home/nix/<dirname>` and set as the
 working directory inside the container. The entrypoint is `nix-shell`, so the
 container drops you into the project's resolved environment.
 
+### Running a command and exiting
+
+To run a command inside the project's environment instead of opening an
+interactive shell, use `run`:
+
+```sh
+nix-container run npm test
+```
+
+Everything after `run` is treated as the command (and its arguments), so any
+options must come before it:
+
+```sh
+nix-container --with-aws run aws s3 ls
+```
+
+The command executes inside the resolved `nix-shell` environment, its exit
+status is propagated, and the container exits when it finishes. A TTY is only
+allocated when both stdin and stdout are terminals, so output stays pipeable
+in scripts and CI:
+
+```sh
+nix-container run node -e 'console.log(1 + 1)' | cat
+```
+
 ### Options
 
 | Flag                       | Effect                                                                                          |
