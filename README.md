@@ -9,6 +9,7 @@ Nix on the host.
   Apple's `container`). All Nix tooling lives inside the image.
 - **Per-project shells.** Drop a `shell.nix` (or `default.nix`) into any
   directory and start a container that auto-launches `nix-shell` against it.
+  Recurring options can live in a `nix-container.yml` next to it.
 - **Cache across runs.** The Nix store and CLI caches are persisted in named
   volumes so packages don't re-download every invocation.
 
@@ -52,7 +53,9 @@ current directory:
 nix-container-init
 ```
 
-Edit the generated `shell.nix` to add packages, then run `nix-container`.
+Edit the generated `shell.nix` to add packages, then run `nix-container`. To
+also fix the options that run should use (forwarded credentials, published
+ports, memory, ...), add a [`nix-container.yml`](#configuration-file).
 
 ## Usage
 
@@ -102,6 +105,58 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
+| `--config <file>`          | Read options from `<file>` instead of `./nix-container.yml`. See [Configuration file](#configuration-file). |
+| `--no-config`              | Ignore `./nix-container.yml` and use only the options given on the command line. |
+
+### Configuration file
+
+Anything from the table above (except `--config` itself) can be set once in a
+`nix-container.yml` next to the project's `shell.nix`, so it doesn't have to be
+retyped on every run:
+
+```yaml
+# nix-container.yml
+with-gh-token: true
+with-npmrc: true
+with-aws: dev            # true for the default profile, or a profile name
+with-env: .env           # relative to this file
+memory: 4G
+ports:
+  - 8080
+  - 3000:3000
+```
+
+With that file in place, a bare `nix-container` behaves like:
+
+```sh
+nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
+  --memory 4G -p 8080 -p 3000:3000
+```
+
+`nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
+may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
+accept `true`/`false`, `yes`/`no` and `on`/`off`. Ports may also be written
+inline (`ports: [8080, 3000:3000]`) or as a single value (`ports: 8080`).
+The file is parsed by the script itself, so no YAML tooling is needed on the
+host — which also means only this flat subset of YAML is understood. Unknown
+keys and malformed values are reported with a line number and abort the run.
+
+Precedence, highest first:
+
+1. Command line flags.
+2. `nix-container.yml` (or the file given to `--config`).
+3. Environment variables (`NIX_CONTAINER_MEMORY`).
+
+A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
+set in the file, and passing any `-p` replaces *all* ports from the file rather
+than adding to them. To ignore the file for a single run:
+
+```sh
+nix-container --no-config
+```
+
+The file only configures how the container is run; it has no effect on the
+cache volumes, which are still keyed on the contents of `shell.nix`.
 
 ### Memory
 
@@ -118,13 +173,21 @@ passed straight through to the container CLI's `--memory` (a hard limit on
 docker, the guest VM size on Apple's `container`). Malformed values are
 rejected before a container is started.
 
-To set a default for every run, export it from your shell rc:
+To set a default for a single project, put it in its
+[`nix-container.yml`](#configuration-file):
+
+```yaml
+memory: 4G
+```
+
+To set a default for every project, export it from your shell rc:
 
 ```sh
 export NIX_CONTAINER_MEMORY=8G
 ```
 
-The flag takes precedence over the environment variable.
+The flag takes precedence over `nix-container.yml`, which takes precedence over
+the environment variable.
 
 ### Picking a specific container CLI
 
@@ -205,9 +268,10 @@ environment variables. It also mounts:
 
 ## Environment files & secrets
 
-`--with-env <file>` loads environment variables from a dotenv-style file
-(`KEY=value` lines, `#` comments and blank lines ignored). It takes one of two
-paths depending on the file's contents:
+`--with-env <file>` (or `with-env:` in a
+[`nix-container.yml`](#configuration-file)) loads environment variables from a
+dotenv-style file (`KEY=value` lines, `#` comments and blank lines ignored). It
+takes one of two paths depending on the file's contents:
 
 - **Plain values** — the file is handed straight to the container CLI's
   `--env-file`, and no extra tooling is required.

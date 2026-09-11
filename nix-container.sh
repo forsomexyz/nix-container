@@ -55,6 +55,195 @@ _nix_container_valid_memory() {
     [ -n "$num" ] && [ -z "${num//[0-9]/}" ]
 }
 
+# Trim leading and trailing whitespace from a string.
+_nix_container_trim() {
+    local s="$1"
+    while :; do
+        case "$s" in
+            [[:space:]]*) s="${s#?}" ;;
+            *) break ;;
+        esac
+    done
+    while :; do
+        case "$s" in
+            *[[:space:]]) s="${s%?}" ;;
+            *) break ;;
+        esac
+    done
+    printf '%s\n' "$s"
+}
+
+# Unwrap a YAML scalar: strip surrounding quotes, or drop a trailing
+# `# comment` from an unquoted value. Only covers the flat subset of YAML that
+# nix-container.yml uses (no multi-line or folded scalars).
+_nix_container_yaml_scalar() {
+    local v
+    v=$(_nix_container_trim "$1")
+    case "$v" in
+        '#'*) v="" ;;
+        '"'*)
+            v="${v#\"}"
+            v="${v%%\"*}"
+            ;;
+        \'*)
+            v="${v#\'}"
+            v="${v%%\'*}"
+            ;;
+        *[[:space:]]'#'*)
+            v=$(_nix_container_trim "${v%%[[:space:]]#*}")
+            ;;
+    esac
+    printf '%s\n' "$v"
+}
+
+# Echo 1 or 0 for a YAML boolean, or return non-zero if the value isn't one.
+_nix_container_yaml_bool() {
+    case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+        true|yes|on) echo 1 ;;
+        false|no|off) echo 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Echo the project's config file (nix-container.yml or nix-container.yaml) in
+# the current directory, or return non-zero if neither exists.
+_nix_container_config_file() {
+    if [ -f nix-container.yml ]; then
+        echo nix-container.yml
+    elif [ -f nix-container.yaml ]; then
+        echo nix-container.yaml
+    else
+        return 1
+    fi
+}
+
+# Parse a nix-container.yml into a normalized `key=value` stream on stdout (one
+# setting per line, ports repeated as `port=<spec>`), or fail with a file:line
+# diagnostic. Deliberately a small hand-rolled reader rather than a dependency
+# on yq/python: the host is only supposed to need a container CLI. Understood
+# syntax: `key: value` scalars with optional quotes and `#` comments, plus block
+# (`- x`) and flow (`[x, y]`) sequences for the one list-valued option (ports).
+_nix_container_parse_config() {
+    local file="$1"
+    local lineno=0 line trimmed key value bool item rest list_key=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        line="${line%$'\r'}"
+        trimmed=$(_nix_container_trim "$line")
+
+        # Blank lines, comments and a leading document marker carry no settings.
+        case "$trimmed" in
+            ''|'#'*|'---') continue ;;
+        esac
+
+        # A `- item` line extends the list opened by the most recent key.
+        case "$trimmed" in
+            -|'- '*)
+                value=$(_nix_container_yaml_scalar "${trimmed#-}")
+                if [ -z "$list_key" ]; then
+                    echo "nix-container: $file:$lineno: list item outside of an option that takes a list" >&2
+                    return 1
+                fi
+                if [ -z "$value" ]; then
+                    echo "nix-container: $file:$lineno: empty list item for '$list_key'" >&2
+                    return 1
+                fi
+                # ports is the only list-valued option.
+                printf 'port=%s\n' "$value"
+                continue
+                ;;
+        esac
+
+        case "$trimmed" in
+            *:*) ;;
+            *)
+                echo "nix-container: $file:$lineno: expected 'option: value', got: $trimmed" >&2
+                return 1
+                ;;
+        esac
+
+        key=$(_nix_container_trim "${trimmed%%:*}")
+        value=$(_nix_container_yaml_scalar "${trimmed#*:}")
+        # Accept underscores as an alternate spelling of the dashes the command
+        # line flags use, so `with_aws` and `with-aws` both work.
+        key=$(printf '%s' "$key" | tr '_' '-')
+        # Any key other than a list-valued one closes an open list.
+        list_key=""
+
+        case "$key" in
+            with-gh-token|with-npmrc)
+                if ! bool=$(_nix_container_yaml_bool "$value"); then
+                    echo "nix-container: $file:$lineno: '$key' expects true or false, got: ${value:-<empty>}" >&2
+                    return 1
+                fi
+                printf '%s=%s\n' "$key" "$bool"
+                ;;
+            with-aws)
+                # true/false toggle credential forwarding; any other value names
+                # the profile to resolve credentials from.
+                if bool=$(_nix_container_yaml_bool "$value"); then
+                    printf 'with-aws=%s\n' "$bool"
+                elif [ -n "$value" ]; then
+                    printf 'with-aws=1\naws-profile=%s\n' "$value"
+                else
+                    echo "nix-container: $file:$lineno: 'with-aws' expects true, false or a profile name" >&2
+                    return 1
+                fi
+                ;;
+            with-env)
+                if [ -z "$value" ]; then
+                    echo "nix-container: $file:$lineno: 'with-env' expects a file path" >&2
+                    return 1
+                fi
+                printf 'env-file=%s\n' "$value"
+                ;;
+            memory)
+                if ! _nix_container_valid_memory "$value"; then
+                    echo "nix-container: $file:$lineno: invalid memory size: ${value:-<empty>} (expected a number with an optional K/M/G/T/P suffix, e.g. 512M or 4G)" >&2
+                    return 1
+                fi
+                printf 'memory=%s\n' "$value"
+                ;;
+            port|ports)
+                # Either an inline `[a, b]` flow sequence, a single scalar, or a
+                # `- spec` block on the lines that follow.
+                list_key=ports
+                case "$value" in
+                    '') ;;
+                    '['*']')
+                        rest="${value#\[}"
+                        rest="${rest%\]}"
+                        while [ -n "$rest" ]; do
+                            case "$rest" in
+                                *,*)
+                                    item="${rest%%,*}"
+                                    rest="${rest#*,}"
+                                    ;;
+                                *)
+                                    item="$rest"
+                                    rest=""
+                                    ;;
+                            esac
+                            item=$(_nix_container_yaml_scalar "$item")
+                            if [ -z "$item" ]; then
+                                echo "nix-container: $file:$lineno: empty list item for '$key'" >&2
+                                return 1
+                            fi
+                            printf 'port=%s\n' "$item"
+                        done
+                        ;;
+                    *) printf 'port=%s\n' "$value" ;;
+                esac
+                ;;
+            *)
+                echo "nix-container: $file:$lineno: unknown option: $key" >&2
+                return 1
+                ;;
+        esac
+    done < "$file"
+}
+
 # Echo the project's nix file (shell.nix or default.nix) in the current
 # directory, or return non-zero if neither exists.
 _nix_container_nix_file() {
@@ -397,13 +586,21 @@ EOF
 }
 
 nix-container() {
-    local with_gh_token=0
-    local with_aws=0
-    local with_npmrc=0
-    local with_env=0
+    # Options start out unset (empty / 0 markers) so that, after the command
+    # line is parsed, nix-container.yml can fill in whatever wasn't given
+    # explicitly. cli_aws/cli_ports mark options where the config contributes
+    # more than one value (profile, repeated ports) and a flag must suppress
+    # all of it.
+    local with_gh_token=""
+    local with_aws=""
+    local with_npmrc=""
     local env_file=""
     local aws_profile=""
-    local memory="${NIX_CONTAINER_MEMORY:-}"
+    local memory=""
+    local cli_aws=0
+    local cli_ports=0
+    local config_file=""
+    local use_config=1
     local do_run=0
     local -a run_cmd=()
     local -a port_args=()
@@ -421,6 +618,9 @@ With `run`, COMMAND is executed inside the project's nix-shell environment
 and the container exits, instead of opening an interactive shell. Everything
 after `run` is treated as the command, so options must come before it.
 
+Options not given on the command line default to the ones set in
+./nix-container.yml (or ./nix-container.yaml), if that file exists.
+
 Options:
   --with-gh-token       Forward a GitHub token from 'gh auth token' as GH_TOKEN.
   --with-aws            Forward AWS credentials from the host (uses default profile).
@@ -434,10 +634,13 @@ Options:
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
+                        Overrides the ports set in nix-container.yml.
   -m, --memory SIZE     Amount of memory the container may use, passed to the
                         container CLI's --memory. SIZE is a number with an
                         optional K, M, G, T or P suffix (e.g. 512M, 4G).
-                        Defaults to $NIX_CONTAINER_MEMORY if set.
+                        Defaults to nix-container.yml, then $NIX_CONTAINER_MEMORY.
+  --config FILE         Read options from FILE instead of ./nix-container.yml.
+  --no-config           Ignore ./nix-container.yml.
   -h, --help            Show this help message.
 EOF
                 return 0
@@ -448,10 +651,12 @@ EOF
                 ;;
             --with-aws)
                 with_aws=1
+                cli_aws=1
                 shift
                 ;;
             --with-aws=*)
                 with_aws=1
+                cli_aws=1
                 aws_profile="${1#--with-aws=}"
                 shift
                 ;;
@@ -464,12 +669,14 @@ EOF
                     echo "nix-container: $1 requires a file argument" >&2
                     return 1
                 fi
-                with_env=1
                 env_file="$2"
                 shift 2
                 ;;
             --with-env=*)
-                with_env=1
+                if [ -z "${1#--with-env=}" ]; then
+                    echo "nix-container: --with-env requires a file argument" >&2
+                    return 1
+                fi
                 env_file="${1#--with-env=}"
                 shift
                 ;;
@@ -478,10 +685,12 @@ EOF
                     echo "nix-container: $1 requires a value (e.g. 8080 or 8080:8080)" >&2
                     return 1
                 fi
+                cli_ports=1
                 port_args+=(-p "$(_nix_container_force_loopback "$2")")
                 shift 2
                 ;;
             -p=*|--port=*)
+                cli_ports=1
                 port_args+=(-p "$(_nix_container_force_loopback "${1#*=}")")
                 shift
                 ;;
@@ -495,6 +704,28 @@ EOF
                 ;;
             -m=*|--memory=*)
                 memory="${1#*=}"
+                shift
+                ;;
+            --config)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a file argument" >&2
+                    return 1
+                fi
+                config_file="$2"
+                use_config=1
+                shift 2
+                ;;
+            --config=*)
+                if [ -z "${1#--config=}" ]; then
+                    echo "nix-container: --config requires a file argument" >&2
+                    return 1
+                fi
+                config_file="${1#--config=}"
+                use_config=1
+                shift
+                ;;
+            --no-config)
+                use_config=0
                 shift
                 ;;
             run)
@@ -519,6 +750,64 @@ EOF
         echo "nix-container: no shell.nix or default.nix in current directory" >&2
         return 1
     }
+
+    # Fill in anything the command line didn't set from the project's config
+    # file, so recurring options don't have to be typed on every run. An
+    # explicit --config must exist; a discovered one is optional.
+    if [ "$use_config" -eq 1 ]; then
+        if [ -z "$config_file" ]; then
+            config_file=$(_nix_container_config_file) || config_file=""
+        elif [ ! -f "$config_file" ]; then
+            echo "nix-container: --config: file not found: $config_file" >&2
+            return 1
+        fi
+    else
+        config_file=""
+    fi
+
+    if [ -n "$config_file" ]; then
+        local config_settings config_dir setting cfg_key cfg_value
+        config_settings=$(_nix_container_parse_config "$config_file") || return 1
+        config_dir=$(dirname "$config_file")
+        # A here-string (not a pipe) so port_args survives the loop.
+        while IFS= read -r setting; do
+            [ -n "$setting" ] || continue
+            cfg_key="${setting%%=*}"
+            cfg_value="${setting#*=}"
+            case "$cfg_key" in
+                with-gh-token) [ -n "$with_gh_token" ] || with_gh_token="$cfg_value" ;;
+                with-npmrc) [ -n "$with_npmrc" ] || with_npmrc="$cfg_value" ;;
+                with-aws) [ "$cli_aws" -eq 1 ] || with_aws="$cfg_value" ;;
+                aws-profile) [ "$cli_aws" -eq 1 ] || aws_profile="$cfg_value" ;;
+                memory) [ -n "$memory" ] || memory="$cfg_value" ;;
+                port) [ "$cli_ports" -eq 1 ] || port_args+=(-p "$(_nix_container_force_loopback "$cfg_value")") ;;
+                env-file)
+                    # Relative paths resolve against the config file's own
+                    # directory, which is the project directory unless --config
+                    # pointed somewhere else.
+                    if [ -z "$env_file" ]; then
+                        case "$cfg_value" in
+                            /*) env_file="$cfg_value" ;;
+                            *)
+                                if [ "$config_dir" = . ]; then
+                                    env_file="$cfg_value"
+                                else
+                                    env_file="$config_dir/$cfg_value"
+                                fi
+                                ;;
+                        esac
+                    fi
+                    ;;
+            esac
+        done <<< "$config_settings"
+    fi
+
+    # Settle the remaining defaults now that flags and config have been merged:
+    # off for the toggles, and the environment for the memory limit.
+    : "${with_gh_token:=0}"
+    : "${with_aws:=0}"
+    : "${with_npmrc:=0}"
+    : "${memory:=${NIX_CONTAINER_MEMORY:-}}"
 
     local cli
     cli=$(_nix_container_cli) || return 1
@@ -587,9 +876,9 @@ EOF
     # Wrap the container invocation in `op run` only when the env file actually
     # carries 1Password secret references; empty otherwise so the run is direct.
     local -a op_prefix=()
-    if [ "$with_env" -eq 1 ]; then
+    if [ -n "$env_file" ]; then
         if [ ! -f "$env_file" ]; then
-            echo "nix-container: --with-env: file not found: $env_file" >&2
+            echo "nix-container: env file not found: $env_file" >&2
             return 1
         fi
         # If the file contains 1Password secret references (op://...), resolve
@@ -600,7 +889,7 @@ EOF
         # references is handed to the CLI's own --env-file, no op required.
         if grep -q 'op://' "$env_file"; then
             if ! command -v op >/dev/null 2>&1; then
-                echo "nix-container: --with-env: $env_file has 1Password secret references (op://) but the 'op' CLI is not in PATH" >&2
+                echo "nix-container: $env_file has 1Password secret references (op://) but the 'op' CLI is not in PATH" >&2
                 return 1
             fi
             local line name
