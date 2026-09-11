@@ -39,6 +39,22 @@ _nix_container_force_loopback() {
     esac
 }
 
+# Validate a memory size accepted by the container CLIs' `--memory`: a number
+# with an optional K/M/G/T/P suffix (case-insensitive, an optional trailing `b`
+# is allowed too, so `2G` and `2GB` are both fine). The value is passed through
+# to the CLI unchanged, so only the shape is checked here to catch typos before
+# a container is started.
+_nix_container_valid_memory() {
+    local num="$1"
+    case "$num" in
+        *[bB]) num="${num%?}" ;;
+    esac
+    case "$num" in
+        *[kKmMgGtTpP]) num="${num%?}" ;;
+    esac
+    [ -n "$num" ] && [ -z "${num//[0-9]/}" ]
+}
+
 # Echo the project's nix file (shell.nix or default.nix) in the current
 # directory, or return non-zero if neither exists.
 _nix_container_nix_file() {
@@ -387,6 +403,7 @@ nix-container() {
     local with_env=0
     local env_file=""
     local aws_profile=""
+    local memory="${NIX_CONTAINER_MEMORY:-}"
     local do_run=0
     local -a run_cmd=()
     local -a port_args=()
@@ -417,6 +434,10 @@ Options:
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
+  -m, --memory SIZE     Amount of memory the container may use, passed to the
+                        container CLI's --memory. SIZE is a number with an
+                        optional K, M, G, T or P suffix (e.g. 512M, 4G).
+                        Defaults to $NIX_CONTAINER_MEMORY if set.
   -h, --help            Show this help message.
 EOF
                 return 0
@@ -462,6 +483,18 @@ EOF
                 ;;
             -p=*|--port=*)
                 port_args+=(-p "$(_nix_container_force_loopback "${1#*=}")")
+                shift
+                ;;
+            -m|--memory)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a value (e.g. 512M or 4G)" >&2
+                    return 1
+                fi
+                memory="$2"
+                shift 2
+                ;;
+            -m=*|--memory=*)
+                memory="${1#*=}"
                 shift
                 ;;
             run)
@@ -594,6 +627,17 @@ EOF
     local kind
     kind=$(_nix_container_cli_kind "$cli")
 
+    # Memory limit: both docker and `container` take `--memory` with the same
+    # suffixed-size syntax (on `container` it sizes the guest VM).
+    local -a memory_args=()
+    if [ -n "$memory" ]; then
+        if ! _nix_container_valid_memory "$memory"; then
+            echo "nix-container: --memory: invalid memory size: $memory (expected a number with an optional K/M/G/T/P suffix, e.g. 512M or 4G)" >&2
+            return 1
+        fi
+        memory_args+=(--memory "$memory")
+    fi
+
     # Apple's `container` needs extra run flags that docker doesn't:
     #   --user  the image's `USER nix` (a name) fails to start on `container`;
     #           a numeric uid:gid works, and since the base is built with the
@@ -628,6 +672,7 @@ EOF
         "${env_args[@]}"
         "${mount_args[@]}"
         "${port_args[@]}"
+        "${memory_args[@]}"
         -v "nix-container-store-$hash:/nix"
         -v "nix-container-cache-$hash:/home/nix/.cache"
         -v "$PWD:/home/nix/$dir"

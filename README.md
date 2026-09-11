@@ -101,6 +101,30 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
+| `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
+
+### Memory
+
+By default the container gets whatever the runtime hands out (all of the host's
+memory on docker, the `container` service's default VM size on Apple's
+`container`). To override that for a run:
+
+```sh
+nix-container --memory 4G
+```
+
+`<size>` is a number with an optional `K`, `M`, `G`, `T` or `P` suffix, and is
+passed straight through to the container CLI's `--memory` (a hard limit on
+docker, the guest VM size on Apple's `container`). Malformed values are
+rejected before a container is started.
+
+To set a default for every run, export it from your shell rc:
+
+```sh
+export NIX_CONTAINER_MEMORY=8G
+```
+
+The flag takes precedence over the environment variable.
 
 ### Picking a specific container CLI
 
