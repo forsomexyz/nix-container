@@ -23,19 +23,44 @@ unset _nix_container_src
 # Handles: `<container>`, `<host>:<container>`, `<ip>:<host>:<container>`,
 # all optionally suffixed with `/<proto>`.
 _nix_container_force_loopback() {
-    local spec="$1"
+    local original="$1" spec="$1"
     local proto=""
     if [[ "$spec" == */* ]]; then
         proto="/${spec##*/}"
         spec="${spec%/*}"
     fi
 
+    # Docker requires brackets around an IPv6 host address. Discard that
+    # address just like an IPv4 one, but require exactly host:container after
+    # the closing bracket so an ambiguous spec can never pass through unchanged.
+    if [[ "$spec" == \[* ]]; then
+        local address rest rest_colons
+        case "$spec" in
+            \[*\]:*)
+                address="${spec%%]*}"
+                address="${address#\[}"
+                rest="${spec#*]}"
+                rest="${rest#:}"
+                rest_colons="${rest//[^:]/}"
+                if [[ "$address" == *:* ]] && [ "${#rest_colons}" -eq 1 ]; then
+                    printf '127.0.0.1:%s%s\n' "$rest" "$proto"
+                    return 0
+                fi
+                ;;
+        esac
+        printf 'nix-container: invalid port specification: %s\n' "$original" >&2
+        return 1
+    fi
+
     local colons="${spec//[^:]/}"
     case "${#colons}" in
-        0) echo "127.0.0.1:${spec}:${spec}${proto}" ;;
-        1) echo "127.0.0.1:${spec}${proto}" ;;
-        2) echo "127.0.0.1:${spec#*:}${proto}" ;;
-        *) echo "${spec}${proto}" ;;
+        0) printf '127.0.0.1:%s:%s%s\n' "$spec" "$spec" "$proto" ;;
+        1) printf '127.0.0.1:%s%s\n' "$spec" "$proto" ;;
+        2) printf '127.0.0.1:%s%s\n' "${spec#*:}" "$proto" ;;
+        *)
+            printf 'nix-container: invalid port specification: %s\n' "$original" >&2
+            return 1
+            ;;
     esac
 }
 
@@ -602,6 +627,7 @@ nix-container() {
     local config_file=""
     local use_config=1
     local do_run=0
+    local normalized_port=""
     local -a run_cmd=()
     local -a port_args=()
     while [ $# -gt 0 ]; do
@@ -686,12 +712,14 @@ EOF
                     return 1
                 fi
                 cli_ports=1
-                port_args+=(-p "$(_nix_container_force_loopback "$2")")
+                normalized_port=$(_nix_container_force_loopback "$2") || return 1
+                port_args+=(-p "$normalized_port")
                 shift 2
                 ;;
             -p=*|--port=*)
                 cli_ports=1
-                port_args+=(-p "$(_nix_container_force_loopback "${1#*=}")")
+                normalized_port=$(_nix_container_force_loopback "${1#*=}") || return 1
+                port_args+=(-p "$normalized_port")
                 shift
                 ;;
             -m|--memory)
@@ -780,7 +808,12 @@ EOF
                 with-aws) [ "$cli_aws" -eq 1 ] || with_aws="$cfg_value" ;;
                 aws-profile) [ "$cli_aws" -eq 1 ] || aws_profile="$cfg_value" ;;
                 memory) [ -n "$memory" ] || memory="$cfg_value" ;;
-                port) [ "$cli_ports" -eq 1 ] || port_args+=(-p "$(_nix_container_force_loopback "$cfg_value")") ;;
+                port)
+                    if [ "$cli_ports" -ne 1 ]; then
+                        normalized_port=$(_nix_container_force_loopback "$cfg_value") || return 1
+                        port_args+=(-p "$normalized_port")
+                    fi
+                    ;;
                 env-file)
                     # Relative paths resolve against the config file's own
                     # directory, which is the project directory unless --config
