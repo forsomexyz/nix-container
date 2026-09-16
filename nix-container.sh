@@ -106,26 +106,58 @@ _nix_container_trim() {
     printf '%s\n' "$s"
 }
 
-# Unwrap a YAML scalar: strip surrounding quotes, or drop a trailing
-# `# comment` from an unquoted value. Only covers the flat subset of YAML that
+# Unwrap a simple YAML scalar: strip matching surrounding quotes, or drop a
+# trailing `# comment` from an unquoted value. Quoted values deliberately do
+# not support embedded quote escapes; rejecting them is safer than silently
+# interpreting only part of a value. Only covers the flat subset of YAML that
 # nix-container.yml uses (no multi-line or folded scalars).
 _nix_container_yaml_scalar() {
-    local v
+    local v tail=""
     v=$(_nix_container_trim "$1")
     case "$v" in
         '#'*) v="" ;;
         '"'*)
             v="${v#\"}"
-            v="${v%%\"*}"
+            case "$v" in
+                *\"*)
+                    tail="${v#*\"}"
+                    v="${v%%\"*}"
+                    # Backslash escapes are outside the supported YAML subset.
+                    case "$v" in
+                        *\\*) return 1 ;;
+                    esac
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
         \'*)
             v="${v#\'}"
-            v="${v%%\'*}"
+            case "$v" in
+                *\'*)
+                    tail="${v#*\'}"
+                    v="${v%%\'*}"
+                    ;;
+                *) return 1 ;;
+            esac
             ;;
         *[[:space:]]'#'*)
             v=$(_nix_container_trim "${v%%[[:space:]]#*}")
             ;;
     esac
+
+    # After a closing quote, permit only whitespace and an optional comment.
+    case "$tail" in
+        '') ;;
+        [[:space:]]*)
+            tail=$(_nix_container_trim "$tail")
+            case "$tail" in
+                '#'*) ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+
     printf '%s\n' "$v"
 }
 
@@ -173,7 +205,10 @@ _nix_container_parse_config() {
         # A `- item` line extends the list opened by the most recent key.
         case "$trimmed" in
             -|'- '*)
-                value=$(_nix_container_yaml_scalar "${trimmed#-}")
+                if ! value=$(_nix_container_yaml_scalar "${trimmed#-}"); then
+                    echo "nix-container: $file:$lineno: malformed quoted scalar" >&2
+                    return 1
+                fi
                 if [ -z "$list_key" ]; then
                     echo "nix-container: $file:$lineno: list item outside of an option that takes a list" >&2
                     return 1
@@ -197,7 +232,10 @@ _nix_container_parse_config() {
         esac
 
         key=$(_nix_container_trim "${trimmed%%:*}")
-        value=$(_nix_container_yaml_scalar "${trimmed#*:}")
+        if ! value=$(_nix_container_yaml_scalar "${trimmed#*:}"); then
+            echo "nix-container: $file:$lineno: malformed quoted scalar" >&2
+            return 1
+        fi
         # Accept underscores as an alternate spelling of the dashes the command
         # line flags use, so `with_aws` and `with-aws` both work.
         key=$(printf '%s' "$key" | tr '_' '-')
@@ -258,7 +296,10 @@ _nix_container_parse_config() {
                                     rest=""
                                     ;;
                             esac
-                            item=$(_nix_container_yaml_scalar "$item")
+                            if ! item=$(_nix_container_yaml_scalar "$item"); then
+                                echo "nix-container: $file:$lineno: malformed quoted scalar in '$key'" >&2
+                                return 1
+                            fi
                             if [ -z "$item" ]; then
                                 echo "nix-container: $file:$lineno: empty list item for '$key'" >&2
                                 return 1

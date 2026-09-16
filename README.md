@@ -138,8 +138,10 @@ may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
 accept `true`/`false`, `yes`/`no` and `on`/`off`. Ports may also be written
 inline (`ports: [8080, 3000:3000]`) or as a single value (`ports: 8080`).
 The file is parsed by the script itself, so no YAML tooling is needed on the
-host — which also means only this flat subset of YAML is understood. Unknown
-keys and malformed values are reported with a line number and abort the run.
+host — which also means only this flat subset of YAML is understood. Quoted
+scalars must have a matching delimiter; embedded quote escapes are not
+supported. Unknown keys and malformed values are reported with a line number
+and abort the run.
 
 Precedence, highest first:
 
