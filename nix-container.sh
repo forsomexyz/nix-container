@@ -105,6 +105,33 @@ _nix_container_yaml_bool() {
     esac
 }
 
+# Parse a YAML flow sequence (`[a, b, c]`) into one item per line on stdout,
+# or fail with a file:line diagnostic on an empty item.
+_nix_container_yaml_flow_items() {
+    local value="$1" file="$2" lineno="$3" key="$4"
+    local rest item
+    rest="${value#\[}"
+    rest="${rest%\]}"
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            *,*)
+                item="${rest%%,*}"
+                rest="${rest#*,}"
+                ;;
+            *)
+                item="$rest"
+                rest=""
+                ;;
+        esac
+        item=$(_nix_container_yaml_scalar "$item")
+        if [ -z "$item" ]; then
+            echo "nix-container: $file:$lineno: empty list item for '$key'" >&2
+            return 1
+        fi
+        printf '%s\n' "$item"
+    done
+}
+
 # Echo the project's config file (nix-container.yml or nix-container.yaml) in
 # the current directory, or return non-zero if neither exists.
 _nix_container_config_file() {
@@ -122,10 +149,13 @@ _nix_container_config_file() {
 # diagnostic. Deliberately a small hand-rolled reader rather than a dependency
 # on yq/python: the host is only supposed to need a container CLI. Understood
 # syntax: `key: value` scalars with optional quotes and `#` comments, plus block
-# (`- x`) and flow (`[x, y]`) sequences for the one list-valued option (ports).
+# (`- x`) and flow (`[x, y]`) sequences for the list-valued options (ports,
+# with-shared-nix-exprs).
+# shellcheck disable=SC2094  # $file is only passed to the flow-items helper
+# for error messages; nothing writes to it while the loop reads it.
 _nix_container_parse_config() {
     local file="$1"
-    local lineno=0 line trimmed key value bool item rest list_key=""
+    local lineno=0 line trimmed key value bool item items list_key="" list_out=""
 
     while IFS= read -r line || [ -n "$line" ]; do
         lineno=$((lineno + 1))
@@ -149,8 +179,7 @@ _nix_container_parse_config() {
                     echo "nix-container: $file:$lineno: empty list item for '$list_key'" >&2
                     return 1
                 fi
-                # ports is the only list-valued option.
-                printf 'port=%s\n' "$value"
+                printf '%s=%s\n' "$list_out" "$value"
                 continue
                 ;;
         esac
@@ -208,32 +237,32 @@ _nix_container_parse_config() {
             port|ports)
                 # Either an inline `[a, b]` flow sequence, a single scalar, or a
                 # `- spec` block on the lines that follow.
-                list_key=ports
+                list_key="$key"
+                list_out=port
                 case "$value" in
                     '') ;;
                     '['*']')
-                        rest="${value#\[}"
-                        rest="${rest%\]}"
-                        while [ -n "$rest" ]; do
-                            case "$rest" in
-                                *,*)
-                                    item="${rest%%,*}"
-                                    rest="${rest#*,}"
-                                    ;;
-                                *)
-                                    item="$rest"
-                                    rest=""
-                                    ;;
-                            esac
-                            item=$(_nix_container_yaml_scalar "$item")
-                            if [ -z "$item" ]; then
-                                echo "nix-container: $file:$lineno: empty list item for '$key'" >&2
-                                return 1
-                            fi
-                            printf 'port=%s\n' "$item"
-                        done
+                        items=$(_nix_container_yaml_flow_items "$value" "$file" "$lineno" "$key") || return 1
+                        while IFS= read -r item; do
+                            [ -n "$item" ] && printf 'port=%s\n' "$item"
+                        done <<< "$items"
                         ;;
                     *) printf 'port=%s\n' "$value" ;;
+                esac
+                ;;
+            with-shared-nix-exprs)
+                # Shared expression dirs (NAME=DIR); same list shapes as ports.
+                list_key="$key"
+                list_out=shared-nix-exprs
+                case "$value" in
+                    '') ;;
+                    '['*']')
+                        items=$(_nix_container_yaml_flow_items "$value" "$file" "$lineno" "$key") || return 1
+                        while IFS= read -r item; do
+                            [ -n "$item" ] && printf 'shared-nix-exprs=%s\n' "$item"
+                        done <<< "$items"
+                        ;;
+                    *) printf 'shared-nix-exprs=%s\n' "$value" ;;
                 esac
                 ;;
             *)
@@ -599,6 +628,8 @@ nix-container() {
     local memory=""
     local cli_aws=0
     local cli_ports=0
+    local cli_shared_exprs=0
+    local -a shared_expr_specs=()
     local config_file=""
     local use_config=1
     local do_run=0
@@ -631,6 +662,14 @@ Options:
                         they are resolved at run time with the 'op' CLI (which
                         must be in PATH); otherwise FILE is passed straight to
                         the container CLI's --env-file.
+  --with-shared-nix-exprs NAME=DIR
+                        Mount DIR read-only at /home/nix/.nix-shared-exprs/NAME
+                        and add NAME=<that path> to NIX_PATH, so the project's
+                        nix files can resolve shared expressions with
+                        import <NAME>. Repeatable. Overrides the dirs set in
+                        nix-container.yml, which override
+                        $NIX_CONTAINER_SHARED_NIX_EXPRS (colon-separated
+                        NAME=DIR entries).
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
@@ -678,6 +717,24 @@ EOF
                     return 1
                 fi
                 env_file="${1#--with-env=}"
+                shift
+                ;;
+            --with-shared-nix-exprs)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a value (NAME=DIR, e.g. common=~/nix-common)" >&2
+                    return 1
+                fi
+                cli_shared_exprs=1
+                shared_expr_specs+=("$2")
+                shift 2
+                ;;
+            --with-shared-nix-exprs=*)
+                if [ -z "${1#--with-shared-nix-exprs=}" ]; then
+                    echo "nix-container: --with-shared-nix-exprs requires a value (NAME=DIR, e.g. common=~/nix-common)" >&2
+                    return 1
+                fi
+                cli_shared_exprs=1
+                shared_expr_specs+=("${1#--with-shared-nix-exprs=}")
                 shift
                 ;;
             -p|--port)
@@ -781,6 +838,18 @@ EOF
                 aws-profile) [ "$cli_aws" -eq 1 ] || aws_profile="$cfg_value" ;;
                 memory) [ -n "$memory" ] || memory="$cfg_value" ;;
                 port) [ "$cli_ports" -eq 1 ] || port_args+=(-p "$(_nix_container_force_loopback "$cfg_value")") ;;
+                shared-nix-exprs)
+                    if [ "$cli_shared_exprs" -ne 1 ]; then
+                        # Relative dirs resolve against the config file's own
+                        # directory, like env-file below. Absolute and ~-based
+                        # dirs pass through untouched.
+                        case "$cfg_value" in
+                            *=/*|*=\~*) ;;
+                            *=*) [ "$config_dir" = . ] || cfg_value="${cfg_value%%=*}=$config_dir/${cfg_value#*=}" ;;
+                        esac
+                        shared_expr_specs+=("$cfg_value")
+                    fi
+                    ;;
                 env-file)
                     # Relative paths resolve against the config file's own
                     # directory, which is the project directory unless --config
@@ -803,11 +872,28 @@ EOF
     fi
 
     # Settle the remaining defaults now that flags and config have been merged:
-    # off for the toggles, and the environment for the memory limit.
+    # off for the toggles, and the environment for the memory limit and the
+    # shared expression dirs ($NIX_CONTAINER_SHARED_NIX_EXPRS, colon-separated NAME=DIR).
     : "${with_gh_token:=0}"
     : "${with_aws:=0}"
     : "${with_npmrc:=0}"
     : "${memory:=${NIX_CONTAINER_MEMORY:-}}"
+    if [ "${#shared_expr_specs[@]}" -eq 0 ] && [ -n "${NIX_CONTAINER_SHARED_NIX_EXPRS:-}" ]; then
+        local expr_rest="$NIX_CONTAINER_SHARED_NIX_EXPRS" expr_item
+        while [ -n "$expr_rest" ]; do
+            case "$expr_rest" in
+                *:*)
+                    expr_item="${expr_rest%%:*}"
+                    expr_rest="${expr_rest#*:}"
+                    ;;
+                *)
+                    expr_item="$expr_rest"
+                    expr_rest=""
+                    ;;
+            esac
+            [ -n "$expr_item" ] && shared_expr_specs+=("$expr_item")
+        done
+    fi
 
     local cli
     cli=$(_nix_container_cli) || return 1
@@ -832,6 +918,56 @@ EOF
 
     if [ "$with_npmrc" -eq 1 ] && [ -f "$HOME/.npmrc" ]; then
         mount_args+=(-v "$HOME/.npmrc:/home/nix/.npmrc:ro")
+    fi
+
+    # Shared expression dirs: mount each NAME=DIR read-only and expose it on
+    # NIX_PATH as <NAME>, so a project's shell.nix can `import <NAME>` instead
+    # of copying shared expressions around. The image's own NIX_PATH entries
+    # (set by docker.nix, pinned in build-base.sh) are re-appended so <nixpkgs>
+    # keeps resolving to the baked channel.
+    if [ "${#shared_expr_specs[@]}" -gt 0 ]; then
+        local expr_spec expr_name expr_dir expr_nix_path="" seen_expr_names=":"
+        for expr_spec in "${shared_expr_specs[@]}"; do
+            case "$expr_spec" in
+                *=*)
+                    expr_name="${expr_spec%%=*}"
+                    expr_dir="${expr_spec#*=}"
+                    ;;
+                *)
+                    echo "nix-container: --with-shared-nix-exprs expects NAME=DIR, got: $expr_spec" >&2
+                    return 1
+                    ;;
+            esac
+            case "$expr_name" in
+                ''|*[!A-Za-z0-9._-]*)
+                    echo "nix-container: --with-shared-nix-exprs: invalid name: ${expr_name:-<empty>} (use letters, digits, '.', '_' or '-')" >&2
+                    return 1
+                    ;;
+            esac
+            case "$seen_expr_names" in
+                *":$expr_name:"*)
+                    echo "nix-container: --with-shared-nix-exprs: duplicate name: $expr_name" >&2
+                    return 1
+                    ;;
+            esac
+            seen_expr_names="$seen_expr_names$expr_name:"
+            # Expand a leading ~ ourselves: values from nix-container.yml or
+            # $NIX_CONTAINER_SHARED_NIX_EXPRS never went through shell expansion, so the
+            # literal '~/' match here is intentional.
+            # shellcheck disable=SC2088
+            case "$expr_dir" in
+                '~') expr_dir="$HOME" ;;
+                '~/'*) expr_dir="$HOME/${expr_dir#\~/}" ;;
+            esac
+            if [ ! -d "$expr_dir" ]; then
+                echo "nix-container: --with-shared-nix-exprs: not a directory: $expr_dir" >&2
+                return 1
+            fi
+            expr_dir=$(cd "$expr_dir" && pwd) || return 1
+            mount_args+=(-v "$expr_dir:/home/nix/.nix-shared-exprs/$expr_name:ro")
+            expr_nix_path="${expr_nix_path:+$expr_nix_path:}$expr_name=/home/nix/.nix-shared-exprs/$expr_name"
+        done
+        env_args+=(-e "NIX_PATH=$expr_nix_path:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels")
     fi
 
     if [ "$with_aws" -eq 1 ]; then

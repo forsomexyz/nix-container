@@ -102,6 +102,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-aws`               | Export resolved AWS credentials as env vars and read-only mount `~/.aws/config` and SSO cache.  |
 | `--with-aws=<profile>`     | Same as `--with-aws`, but resolves credentials from the given profile (sets `AWS_PROFILE` too). |
 | `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
+| `--with-shared-nix-exprs <name>=<dir>`  | Mount `<dir>` read-only and add it to `NIX_PATH` as `<name>`, so the project's nix files can `import <name>`. Repeatable. See [Sharing Nix expressions across projects](#sharing-nix-expressions-across-projects). |
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
@@ -120,6 +121,7 @@ with-gh-token: true
 with-npmrc: true
 with-aws: dev            # true for the default profile, or a profile name
 with-env: .env           # relative to this file
+with-shared-nix-exprs: common=~/nix-common
 memory: 4G
 ports:
   - 8080
@@ -130,7 +132,7 @@ With that file in place, a bare `nix-container` behaves like:
 
 ```sh
 nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
-  --memory 4G -p 8080 -p 3000:3000
+  --with-shared-nix-exprs common=~/nix-common --memory 4G -p 8080 -p 3000:3000
 ```
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
@@ -145,11 +147,12 @@ Precedence, highest first:
 
 1. Command line flags.
 2. `nix-container.yml` (or the file given to `--config`).
-3. Environment variables (`NIX_CONTAINER_MEMORY`).
+3. Environment variables (`NIX_CONTAINER_MEMORY`, `NIX_CONTAINER_SHARED_NIX_EXPRS`).
 
 A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
-set in the file, and passing any `-p` replaces *all* ports from the file rather
-than adding to them. To ignore the file for a single run:
+set in the file, and passing any `-p` (or `--with-shared-nix-exprs`) replaces
+*all* ports (or shared expression dirs) from the file rather than adding to
+them. To ignore the file for a single run:
 
 ```sh
 nix-container --no-config
@@ -157,6 +160,78 @@ nix-container --no-config
 
 The file only configures how the container is run; it has no effect on the
 cache volumes, which are still keyed on the contents of `shell.nix`.
+
+### Sharing Nix expressions across projects
+
+Copying the same `mkShell` boilerplate into every project's `shell.nix`
+invites divergence. Instead, keep the shared parts in one directory on the
+host and hand it to nix-container:
+
+```sh
+nix-container --with-shared-nix-exprs common=~/nix-common
+```
+
+The directory is bind-mounted read-only at `/home/nix/.nix-shared-exprs/common` inside
+the container, and `common=/home/nix/.nix-shared-exprs/common` is prepended to
+`NIX_PATH` (the image's own search path entries are kept, so `<nixpkgs>` still
+resolves to the baked channel). Nix's angle-bracket lookup then resolves
+`<common>` to the shared directory. Structure the shared code as a function so
+each project overrides only what differs:
+
+```nix
+# ~/nix-common/default.nix
+{ pkgs ? import <nixpkgs> {} }:
+{
+  inherit pkgs;
+  mkProjectShell = { packages ? [], shellHook ? "", ... } @ args:
+    pkgs.mkShellNoCC (args // {
+      packages = (with pkgs; [ git jq ]) ++ packages;
+      shellHook = ''
+        export LANG=C.UTF-8
+      '' + shellHook;
+    });
+}
+```
+
+```nix
+# a project's shell.nix
+let common = import <common> {};
+in common.mkProjectShell {
+  packages = with common.pkgs; [ nodejs ];
+}
+```
+
+`--with-shared-nix-exprs` is repeatable (`--with-shared-nix-exprs common=...
+--with-shared-nix-exprs ci=...`). To pin it per project, use [`nix-container.yml`](#configuration-file):
+
+```yaml
+with-shared-nix-exprs:
+  - common=~/nix-common
+```
+
+To set a default for every project, export a colon-separated list from your
+shell rc:
+
+```sh
+export NIX_CONTAINER_SHARED_NIX_EXPRS=common=$HOME/nix-common
+```
+
+Flags override the config file, which overrides the environment variable.
+Relative directories given in `nix-container.yml` resolve against the config
+file's own directory; `~` is expanded in all sources.
+
+Two things to keep in mind:
+
+- Edits to the shared directory take effect on the next run — `nix-shell`
+  re-evaluates every time and the mount tracks the host directory. The cache
+  volumes stay keyed on the project's `shell.nix` contents only, so a changed
+  lib reuses the existing store volume (packages already realised stay
+  cached).
+- The lookup is only as reproducible as the directory's contents. If you need
+  machine-independent pinning (e.g. CI), commit the shared directory to a repo
+  and either check it out at a fixed revision on each machine, or skip
+  `--with-shared-nix-exprs` and `import (builtins.fetchGit { url = ...; rev = ...; })`
+  directly in `shell.nix`.
 
 ### Memory
 

@@ -11,6 +11,11 @@ RUN mkdir -p /home/nix/.cache
 # from writing its own cache (e.g. /home/nix/.aws/cli).
 RUN mkdir -p /home/nix/.aws/sso
 
+# Pre-create as `nix` so bind-mounts under ~/.nix-shared-exprs (from
+# --with-shared-nix-exprs) don't cause the runtime to auto-create the parent
+# directory as root.
+RUN mkdir -p /home/nix/.nix-shared-exprs
+
 ENV LC_ALL=C.UTF-8
 
 ENTRYPOINT ["nix-shell"]
