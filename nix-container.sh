@@ -1053,7 +1053,11 @@ EOF
                 return 1
             fi
             expr_dir=$(cd "$expr_dir" && pwd) || return 1
-            mount_args+=(-v "$expr_dir:/home/nix/.nix-shared-exprs/$expr_name:ro")
+            # The braces around $expr_name are required, not style: this file is
+            # also sourced from zsh, where `$expr_name:ro` parses as the `:r`
+            # history modifier (strip the extension) plus a literal 'o', so
+            # `common` mounted at `.../commono` and `my.lib` at `.../myo`.
+            mount_args+=(-v "$expr_dir:/home/nix/.nix-shared-exprs/${expr_name}:ro")
             expr_nix_path="${expr_nix_path:+$expr_nix_path:}$expr_name=/home/nix/.nix-shared-exprs/$expr_name"
         done
         env_args+=(-e "NIX_PATH=$expr_nix_path:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels")
