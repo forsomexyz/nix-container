@@ -80,6 +80,14 @@ _nix_container_valid_memory() {
     [ -n "$num" ] && [ -z "${num//[0-9]/}" ]
 }
 
+# Return success for a portable shell environment variable name.
+_nix_container_valid_env_name() {
+    case "$1" in
+        ''|[0-9]*|*[!A-Za-z0-9_]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # Trim leading and trailing whitespace from a string.
 _nix_container_trim() {
     local s="$1"
@@ -610,7 +618,14 @@ EOF
     done
 }
 
-nix-container() {
+# Use a subshell so credentials exported for name-only forwarding never alter
+# the caller's shell environment. It also lets us disable inherited xtrace
+# while handling secrets without changing the caller's shell options.
+nix-container() (
+    case "$-" in
+        *x*) set +x ;;
+    esac
+
     # Options start out unset (empty / 0 markers) so that, after the command
     # line is parsed, nix-container.yml can fill in whatever wasn't given
     # explicitly. cli_aws/cli_ports mark options where the config contributes
@@ -855,12 +870,12 @@ EOF
     local -a mount_args=()
     if [ "$with_gh_token" -eq 1 ]; then
         local token
-        token=$(gh auth token 2>/dev/null)
-        if [ -z "$token" ]; then
+        if ! token=$(gh auth token 2>/dev/null) || [ -z "$token" ]; then
             echo "nix-container: failed to get token from 'gh auth token'" >&2
             return 1
         fi
-        env_args+=(-e "GH_TOKEN=$token")
+        export "GH_TOKEN=$token"
+        env_args+=(-e GH_TOKEN)
     fi
 
     if [ "$with_npmrc" -eq 1 ] && [ -f "$HOME/.npmrc" ]; then
@@ -886,23 +901,38 @@ EOF
         fi
         aws_cmd+=(configure export-credentials --format env-no-export)
         local aws_creds
-        aws_creds=$("${aws_cmd[@]}" 2>/dev/null)
-        if [ -z "$aws_creds" ]; then
+        if ! aws_creds=$("${aws_cmd[@]}" 2>/dev/null) || [ -z "$aws_creds" ]; then
             echo "nix-container: --with-aws: '${aws_cmd[*]}' returned no credentials" >&2
             return 1
         fi
-        local line
+        local line name
         while IFS= read -r line; do
-            [ -n "$line" ] && env_args+=(-e "$line")
+            [ -n "$line" ] || continue
+            case "$line" in
+                *=*) name="${line%%=*}" ;;
+                *)
+                    echo "nix-container: --with-aws: '${aws_cmd[*]}' returned malformed credentials" >&2
+                    return 1
+                    ;;
+            esac
+            if ! _nix_container_valid_env_name "$name"; then
+                echo "nix-container: --with-aws: '${aws_cmd[*]}' returned an invalid environment variable name" >&2
+                return 1
+            fi
+            # Export inside this function's subshell, then ask the container CLI
+            # to inherit by name so no credential value appears in its argv.
+            export "$name=${line#*=}"
+            env_args+=(-e "$name")
         done <<< "$aws_creds"
 
         # Forward AWS_PROFILE for tools that inspect it as metadata. The credential
         # env vars above take precedence in the resolution chain, so this won't
         # cause auth to fall back to a missing profile file inside the container.
         if [ -n "$aws_profile" ]; then
-            env_args+=(-e "AWS_PROFILE=$aws_profile")
+            export "AWS_PROFILE=$aws_profile"
+            env_args+=(-e AWS_PROFILE)
         elif [ -n "${AWS_PROFILE:-}" ]; then
-            env_args+=(-e "AWS_PROFILE=$AWS_PROFILE")
+            env_args+=(-e AWS_PROFILE)
         fi
     fi
 
@@ -1047,4 +1077,4 @@ EOF
     fi
 
     return $rc
-}
+)
