@@ -67,7 +67,8 @@ nix-container
 
 The current directory is bind-mounted to `/home/nix/<dirname>` and set as the
 working directory inside the container. The entrypoint is `nix-shell`, so the
-container drops you into the project's resolved environment.
+container drops you into the project's resolved environment. Other host
+directories can be added with [`--mount`](#mounting-extra-directories).
 
 ### Running a command and exiting
 
@@ -103,6 +104,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-aws=<profile>`     | Same as `--with-aws`, but resolves credentials from the given profile (sets `AWS_PROFILE` too). |
 | `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
 | `--with-shared-nix-exprs <name>=<dir>`  | Mount `<dir>` read-only and add it to `NIX_PATH` as `<name>`, so the project's nix files can `import <name>`. Repeatable. See [Sharing Nix expressions across projects](#sharing-nix-expressions-across-projects). |
+| `--mount <spec>`           | Bind-mount an extra host path into the container. `<spec>` is `host[:container][:ro\|:rw]`. Repeatable. See [Mounting extra directories](#mounting-extra-directories). |
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
@@ -126,13 +128,17 @@ memory: 4G
 ports:
   - 8080
   - 3000:3000
+mounts:
+  - ~/datasets:ro
+  - ../shared-lib:/home/nix/shared-lib
 ```
 
 With that file in place, a bare `nix-container` behaves like:
 
 ```sh
 nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
-  --with-shared-nix-exprs common=~/nix-common --memory 4G -p 8080 -p 3000:3000
+  --with-shared-nix-exprs common=~/nix-common --memory 4G -p 8080 -p 3000:3000 \
+  --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib
 ```
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
@@ -152,9 +158,9 @@ Precedence, highest first:
 3. Environment variables (`NIX_CONTAINER_MEMORY`, `NIX_CONTAINER_SHARED_NIX_EXPRS`).
 
 A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
-set in the file, and passing any `-p` (or `--with-shared-nix-exprs`) replaces
-*all* ports (or shared expression dirs) from the file rather than adding to
-them. To ignore the file for a single run:
+set in the file, and passing any `-p` (or `--mount`, `--with-shared-nix-exprs`)
+replaces *all* ports (or mounts, or shared expression dirs) from the file
+rather than adding to them. To ignore the file for a single run:
 
 ```sh
 nix-container --no-config
@@ -162,6 +168,50 @@ nix-container --no-config
 
 The file only configures how the container is run; it has no effect on the
 cache volumes, which are still keyed on the contents of `shell.nix`.
+
+### Mounting extra directories
+
+Only the project directory is mounted by default. To make another host path
+visible inside the container, use `--mount`:
+
+```sh
+nix-container --mount ~/datasets
+```
+
+The spec is `host[:container][:ro|:rw]`:
+
+| Spec                         | Effect                                                        |
+| ---------------------------- | ------------------------------------------------------------- |
+| `~/datasets`                 | Read-write at `/home/nix/datasets`.                            |
+| `~/datasets:ro`              | Read-only at `/home/nix/datasets`.                             |
+| `~/datasets:/srv/data`       | Read-write at `/srv/data`.                                     |
+| `~/datasets:/srv/data:ro`    | Read-only at `/srv/data`.                                      |
+
+In other words, the container path defaults to `/home/nix/` plus the last
+component of the host path, and the mode defaults to `rw` — the same default
+`docker run -v` uses. A second field that isn't `ro` or `rw` is read as the
+container path, which must be absolute.
+
+The flag is repeatable, takes files as well as directories, and expands `~`.
+Relative host paths resolve against the current directory (or, in
+[`nix-container.yml`](#configuration-file), against the config file's own
+directory):
+
+```sh
+nix-container --mount ../shared-lib --mount ~/.gitconfig:/home/nix/.gitconfig:ro
+```
+
+A few things are rejected up front rather than at container startup: a host
+path that doesn't exist (docker would otherwise create it as a new root-owned
+directory that looks like an empty mount), two mounts landing on the same
+container path, and container paths that nix-container manages itself (`/nix`,
+`/home/nix/.cache` and the project directory). Host paths containing a `:`
+aren't supported, the same limitation `docker run -v` has.
+
+Writes through a read-write mount are real writes to the host directory, and
+files created inside the container are owned by the host user (the image is
+built with the host's uid/gid). Mounts are not part of the [cache
+key](#how-caching-works) — only `shell.nix` is.
 
 ### Sharing Nix expressions across projects
 

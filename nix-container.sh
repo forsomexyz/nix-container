@@ -64,6 +64,102 @@ _nix_container_force_loopback() {
     esac
 }
 
+# Normalize a `--mount` spec into the `<src>:<dst>:<mode>` form the container
+# CLIs' `-v` takes. Accepted shapes, with the mode defaulting to `rw`:
+#   <host>                        mounted at /home/nix/<basename of host>
+#   <host>:<container>
+#   <host>:ro|rw
+#   <host>:<container>:ro|rw
+# A second field that isn't `ro` or `rw` is taken as the container path, which
+# the CLIs require to be absolute — so the two are never ambiguous. Host paths
+# are expanded (`~`) and made absolute here, since specs read from
+# nix-container.yml never went through the shell and relative sources are
+# rejected by docker. Host paths containing a `:` are not supported (the same
+# limitation `docker run -v` has).
+_nix_container_mount_spec() {
+    local original="$1" spec="$1"
+    local src dst="" mode="" rest colons base src_dir
+
+    colons="${spec//[^:]/}"
+    case "${#colons}" in
+        0) src="$spec" ;;
+        1)
+            src="${spec%%:*}"
+            rest="${spec#*:}"
+            case "$rest" in
+                ro|rw) mode="$rest" ;;
+                *) dst="$rest" ;;
+            esac
+            ;;
+        2)
+            src="${spec%%:*}"
+            rest="${spec#*:}"
+            dst="${rest%%:*}"
+            mode="${rest#*:}"
+            ;;
+        *)
+            printf 'nix-container: --mount: invalid specification: %s (expected HOST[:CONTAINER][:ro|:rw])\n' "$original" >&2
+            return 1
+            ;;
+    esac
+
+    case "$mode" in
+        ''|ro|rw) ;;
+        *)
+            printf "nix-container: --mount: invalid mode: %s (expected 'ro' or 'rw') in: %s\n" "$mode" "$original" >&2
+            return 1
+            ;;
+    esac
+    : "${mode:=rw}"
+
+    if [ -z "$src" ]; then
+        printf 'nix-container: --mount: missing host path in: %s\n' "$original" >&2
+        return 1
+    fi
+    # Expand a leading ~ ourselves: values from nix-container.yml never went
+    # through shell expansion, so the literal '~/' match here is intentional.
+    # shellcheck disable=SC2088
+    case "$src" in
+        '~') src="$HOME" ;;
+        '~/'*) src="$HOME/${src#\~/}" ;;
+    esac
+    # Refuse to create the source: docker would happily make a missing path a
+    # new root-owned directory, which looks like a silently empty mount.
+    if [ ! -e "$src" ]; then
+        printf 'nix-container: --mount: no such file or directory: %s\n' "$src" >&2
+        return 1
+    fi
+    if [ -d "$src" ]; then
+        src=$(cd "$src" && pwd) || return 1
+    else
+        src_dir=$(cd "$(dirname "$src")" && pwd) || return 1
+        src="${src_dir%/}/$(basename "$src")"
+    fi
+
+    if [ -z "$dst" ]; then
+        base=$(basename "$src")
+        if [ "$base" = / ]; then
+            printf 'nix-container: --mount: cannot derive a container path from %s (use HOST:CONTAINER)\n' "$src" >&2
+            return 1
+        fi
+        dst="/home/nix/$base"
+    fi
+    case "$dst" in
+        /?*) ;;
+        *)
+            printf 'nix-container: --mount: container path must be absolute: %s\n' "$dst" >&2
+            return 1
+            ;;
+    esac
+    # Drop trailing slashes so the reserved-path and duplicate checks in the
+    # caller compare equal paths equal.
+    while [ "$dst" != / ] && [ "${dst%/}" != "$dst" ]; do
+        dst="${dst%/}"
+    done
+
+    printf '%s:%s:%s\n' "$src" "$dst" "$mode"
+}
+
 # Validate a memory size accepted by the container CLIs' `--memory`: a number
 # with an optional K/M/G/T/P suffix (case-insensitive, an optional trailing `b`
 # is allowed too, so `2G` and `2GB` are both fine). The value is passed through
@@ -218,7 +314,7 @@ _nix_container_config_file() {
 # on yq/python: the host is only supposed to need a container CLI. Understood
 # syntax: `key: value` scalars with optional quotes and `#` comments, plus block
 # (`- x`) and flow (`[x, y]`) sequences for the list-valued options (ports,
-# with-shared-nix-exprs).
+# mounts, with-shared-nix-exprs).
 # shellcheck disable=SC2094  # $file is only passed to the flow-items helper
 # for error messages; nothing writes to it while the loop reads it.
 _nix_container_parse_config() {
@@ -322,6 +418,22 @@ _nix_container_parse_config() {
                         done <<< "$items"
                         ;;
                     *) printf 'port=%s\n' "$value" ;;
+                esac
+                ;;
+            mount|mounts)
+                # Extra bind mounts (HOST[:CONTAINER][:ro|:rw]); same list
+                # shapes as ports.
+                list_key="$key"
+                list_out=mount
+                case "$value" in
+                    '') ;;
+                    '['*']')
+                        items=$(_nix_container_yaml_flow_items "$value" "$file" "$lineno" "$key") || return 1
+                        while IFS= read -r item; do
+                            [ -n "$item" ] && printf 'mount=%s\n' "$item"
+                        done <<< "$items"
+                        ;;
+                    *) printf 'mount=%s\n' "$value" ;;
                 esac
                 ;;
             with-shared-nix-exprs)
@@ -709,8 +821,10 @@ nix-container() (
     local memory=""
     local cli_aws=0
     local cli_ports=0
+    local cli_mounts=0
     local cli_shared_exprs=0
     local -a shared_expr_specs=()
+    local -a mount_specs=()
     local config_file=""
     local use_config=1
     local do_run=0
@@ -752,6 +866,12 @@ Options:
                         nix-container.yml, which override
                         $NIX_CONTAINER_SHARED_NIX_EXPRS (colon-separated
                         NAME=DIR entries).
+  --mount SPEC          Bind-mount an extra host path into the container.
+                        SPEC: HOST[:CONTAINER][:ro|:rw]. CONTAINER defaults to
+                        /home/nix/<basename of HOST> and the mode to rw, so
+                        --mount ~/data:ro mounts it read-only at
+                        /home/nix/data. Repeatable. Overrides the mounts set in
+                        nix-container.yml.
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
@@ -817,6 +937,24 @@ EOF
                 fi
                 cli_shared_exprs=1
                 shared_expr_specs+=("${1#--with-shared-nix-exprs=}")
+                shift
+                ;;
+            --mount)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a value (HOST[:CONTAINER][:ro|:rw], e.g. ~/data:ro)" >&2
+                    return 1
+                fi
+                cli_mounts=1
+                mount_specs+=("$2")
+                shift 2
+                ;;
+            --mount=*)
+                if [ -z "${1#--mount=}" ]; then
+                    echo "nix-container: --mount requires a value (HOST[:CONTAINER][:ro|:rw], e.g. ~/data:ro)" >&2
+                    return 1
+                fi
+                cli_mounts=1
+                mount_specs+=("${1#--mount=}")
                 shift
                 ;;
             -p|--port)
@@ -925,6 +1063,19 @@ EOF
                     if [ "$cli_ports" -ne 1 ]; then
                         normalized_port=$(_nix_container_force_loopback "$cfg_value") || return 1
                         port_args+=(-p "$normalized_port")
+                    fi
+                    ;;
+                mount)
+                    if [ "$cli_mounts" -ne 1 ]; then
+                        # Relative host paths resolve against the config file's
+                        # own directory, like shared-nix-exprs and env-file
+                        # below. Absolute and ~-based paths pass through
+                        # untouched.
+                        case "$cfg_value" in
+                            /*|\~*) ;;
+                            *) [ "$config_dir" = . ] || cfg_value="$config_dir/$cfg_value" ;;
+                        esac
+                        mount_specs+=("$cfg_value")
                     fi
                     ;;
                 shared-nix-exprs)
@@ -1061,6 +1212,36 @@ EOF
             expr_nix_path="${expr_nix_path:+$expr_nix_path:}$expr_name=/home/nix/.nix-shared-exprs/$expr_name"
         done
         env_args+=(-e "NIX_PATH=$expr_nix_path:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels")
+    fi
+
+    # Extra bind mounts: each HOST[:CONTAINER][:ro|:rw] spec mounts one more
+    # host path into the container, read-write unless `:ro` says otherwise.
+    if [ "${#mount_specs[@]}" -gt 0 ]; then
+        local mount_spec normalized_mount mount_dst seen_mount_dsts=":" project_dst
+        project_dst="/home/nix/$(basename "$PWD")"
+        for mount_spec in "${mount_specs[@]}"; do
+            normalized_mount=$(_nix_container_mount_spec "$mount_spec") || return 1
+            # <src>:<dst>:<mode>, and neither path can contain a ':' (specs
+            # with extra colons are rejected by the helper).
+            mount_dst="${normalized_mount%:*}"
+            mount_dst="${mount_dst#*:}"
+            # Shadowing one of nix-container's own mounts would either hide the
+            # Nix store or take the project directory out from under nix-shell.
+            case "$mount_dst" in
+                /nix|/home/nix/.cache|"$project_dst")
+                    echo "nix-container: --mount: $mount_dst is mounted by nix-container already (the Nix store, its cache and the project directory cannot be remounted)" >&2
+                    return 1
+                    ;;
+            esac
+            case "$seen_mount_dsts" in
+                *":${mount_dst}:"*)
+                    echo "nix-container: --mount: duplicate container path: $mount_dst" >&2
+                    return 1
+                    ;;
+            esac
+            seen_mount_dsts="${seen_mount_dsts}${mount_dst}:"
+            mount_args+=(-v "$normalized_mount")
+        done
     fi
 
     if [ "$with_aws" -eq 1 ]; then
