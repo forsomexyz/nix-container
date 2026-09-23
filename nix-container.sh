@@ -160,6 +160,96 @@ _nix_container_mount_spec() {
     printf '%s:%s:%s\n' "$src" "$dst" "$mode"
 }
 
+# Normalize a persistence location to an absolute directory in the container.
+# Relative paths live under the nix user's home, and a leading ~/ refers to
+# that container home (not the host's). Colons cannot be represented safely by
+# the CLIs' -v syntax. Dot components are rejected so reserved-path and
+# duplicate checks cannot be bypassed with an equivalent spelling.
+_nix_container_persistence_path() {
+    local original="$1" path="$1"
+
+    if [ -z "$path" ]; then
+        echo "nix-container: --persist: location cannot be empty" >&2
+        return 1
+    fi
+    case "$path" in
+        *:*)
+            echo "nix-container: --persist: location cannot contain ':': $original" >&2
+            return 1
+            ;;
+    esac
+    # An unquoted ~/ on the command line has already expanded to the host home
+    # before this function sees it. Map that prefix to the container home too.
+    if [ -n "${HOME:-}" ]; then
+        case "$path" in
+            "$HOME") path=/home/nix ;;
+            "$HOME"/*) path="/home/nix/${path#"$HOME"/}" ;;
+        esac
+    fi
+    case "$path" in
+        '~') path=/home/nix ;;
+        '~/'*) path="/home/nix/${path#\~/}" ;;
+        '~'*)
+            echo "nix-container: --persist: named home directories are not supported: $original" >&2
+            return 1
+            ;;
+        /*) ;;
+        *) path="/home/nix/$path" ;;
+    esac
+
+    while [ "$path" != / ] && [ "${path%/}" != "$path" ]; do
+        path="${path%/}"
+    done
+    if [ "$path" = / ]; then
+        echo "nix-container: --persist: '/' cannot be a persistence location" >&2
+        return 1
+    fi
+    case "/${path#/}/" in
+        *'//'*)
+            echo "nix-container: --persist: location must not contain repeated '/': $original" >&2
+            return 1
+            ;;
+        *'/./'*|*'/../'*)
+            echo "nix-container: --persist: location must not contain '.' or '..' components: $original" >&2
+            return 1
+            ;;
+    esac
+
+    printf '%s\n' "$path"
+}
+
+# Compute a short, portable hash for a string. Persistence volume names use
+# the physical project directory rather than shell.nix contents, so user data
+# remains attached after the Nix expression changes and cache volumes rotate.
+_nix_container_string_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$1" | sha256sum | cut -c1-8
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$1" | shasum -a 256 | cut -c1-8
+    else
+        echo "nix-container: no sha256 tool found (need sha256sum or shasum)" >&2
+        return 1
+    fi
+}
+
+# Return success when the first argument occurs verbatim in the rest. Arrays
+# are passed explicitly so this works in both bash and zsh without namerefs.
+_nix_container_has_value() {
+    local needle="$1" value
+    shift
+    for value in "$@"; do
+        [ "$value" = "$needle" ] && return 0
+    done
+    return 1
+}
+
+# Return success when two normalized absolute container paths are equal or one
+# is below the other. Nested persistence and other mounts are rejected because
+# their effective ordering is not consistent across supported runtimes.
+_nix_container_paths_overlap() {
+    [ "$1" = "$2" ] || [[ "$1" == "$2/"* ]] || [[ "$2" == "$1/"* ]]
+}
+
 # Validate a memory size accepted by the container CLIs' `--memory`: a number
 # with an optional K/M/G/T/P suffix (case-insensitive, an optional trailing `b`
 # is allowed too, so `2G` and `2GB` are both fine). The value is passed through
@@ -314,7 +404,7 @@ _nix_container_config_file() {
 # on yq/python: the host is only supposed to need a container CLI. Understood
 # syntax: `key: value` scalars with optional quotes and `#` comments, plus block
 # (`- x`) and flow (`[x, y]`) sequences for the list-valued options (ports,
-# mounts, with-shared-nix-exprs).
+# mounts, persistence, with-shared-nix-exprs).
 # shellcheck disable=SC2094  # $file is only passed to the flow-items helper
 # for error messages; nothing writes to it while the loop reads it.
 _nix_container_parse_config() {
@@ -434,6 +524,22 @@ _nix_container_parse_config() {
                         done <<< "$items"
                         ;;
                     *) printf 'mount=%s\n' "$value" ;;
+                esac
+                ;;
+            persist|persistence)
+                # Container directories backed by project-specific named
+                # volumes; same scalar, block-list and flow-list shapes.
+                list_key="$key"
+                list_out=persist
+                case "$value" in
+                    '') ;;
+                    '['*']')
+                        items=$(_nix_container_yaml_flow_items "$value" "$file" "$lineno" "$key") || return 1
+                        while IFS= read -r item; do
+                            [ -n "$item" ] && printf 'persist=%s\n' "$item"
+                        done <<< "$items"
+                        ;;
+                    *) printf 'persist=%s\n' "$value" ;;
                 esac
                 ;;
             with-shared-nix-exprs)
@@ -582,6 +688,33 @@ _nix_container_prepare_volumes() {
         -v "$cache_vol:/seed-cache" \
         nix-container:latest \
         -c "[ -e /seed-nix/store ] || cp -a /nix/. /seed-nix/; chown $owner /seed-cache"
+}
+
+# Create and initialize one user-requested persistence volume. Mounting it at a
+# staging path leaves the requested location visible in the image, allowing us
+# to copy any baked-in initial contents on both Docker (which otherwise does
+# this automatically) and Apple's `container` (which does not). The top-level
+# directory is then owned by the host-mapped nix user rather than root.
+_nix_container_prepare_persistence_volume() {
+    local cli="$1" volume="$2" location="$3" owner="$4"
+
+    "$cli" volume create "$volume" >/dev/null 2>&1 || return 1
+    if ! "$cli" run --rm --user 0 --entrypoint sh \
+            -v "${volume}:/seed-persistence" \
+            nix-container:latest \
+            -c 'set -e
+                if [ -e "$1" ] && [ ! -d "$1" ]; then
+                    echo "persistence location exists in the image but is not a directory: $1" >&2
+                    exit 1
+                fi
+                if [ -d "$1" ] && [ -z "$(ls -A /seed-persistence 2>/dev/null)" ]; then
+                    cp -a "$1"/. /seed-persistence/
+                fi
+                chown -R "$2" /seed-persistence' \
+            _ "$location" "$owner"; then
+        "$cli" volume rm "$volume" >/dev/null 2>&1
+        return 1
+    fi
 }
 
 nix-container-init() {
@@ -822,9 +955,11 @@ nix-container() (
     local cli_aws=0
     local cli_ports=0
     local cli_mounts=0
+    local cli_persistence=0
     local cli_shared_exprs=0
     local -a shared_expr_specs=()
     local -a mount_specs=()
+    local -a persistence_specs=()
     local config_file=""
     local use_config=1
     local do_run=0
@@ -872,6 +1007,10 @@ Options:
                         --mount ~/data:ro mounts it read-only at
                         /home/nix/data. Repeatable. Overrides the mounts set in
                         nix-container.yml.
+  --persist PATH        Back a container directory with a project-specific
+                        named volume so its contents survive container runs.
+                        Relative paths and ~/ resolve under /home/nix.
+                        Repeatable. Overrides persistence in nix-container.yml.
   -p, --port SPEC       Publish a port. Host side is always bound to 127.0.0.1.
                         SPEC: <container>, <host>:<container>, or <ip>:<host>:<container>,
                         optionally suffixed with /<proto>.
@@ -955,6 +1094,24 @@ EOF
                 fi
                 cli_mounts=1
                 mount_specs+=("${1#--mount=}")
+                shift
+                ;;
+            --persist)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a container path (e.g. ~/.local/share/my-tool)" >&2
+                    return 1
+                fi
+                cli_persistence=1
+                persistence_specs+=("$2")
+                shift 2
+                ;;
+            --persist=*)
+                if [ -z "${1#--persist=}" ]; then
+                    echo "nix-container: --persist requires a container path (e.g. ~/.local/share/my-tool)" >&2
+                    return 1
+                fi
+                cli_persistence=1
+                persistence_specs+=("${1#--persist=}")
                 shift
                 ;;
             -p|--port)
@@ -1078,6 +1235,9 @@ EOF
                         mount_specs+=("$cfg_value")
                     fi
                     ;;
+                persist)
+                    [ "$cli_persistence" -eq 1 ] || persistence_specs+=("$cfg_value")
+                    ;;
                 shared-nix-exprs)
                     if [ "$cli_shared_exprs" -ne 1 ]; then
                         # Relative dirs resolve against the config file's own
@@ -1146,6 +1306,8 @@ EOF
 
     local -a env_args=()
     local -a mount_args=()
+    local project_dst="/home/nix/$(basename "$PWD")"
+    local -a occupied_mount_dsts=(/nix /home/nix/.cache "$project_dst")
     if [ "$with_gh_token" -eq 1 ]; then
         local token
         if ! token=$(gh auth token 2>/dev/null) || [ -z "$token" ]; then
@@ -1158,6 +1320,7 @@ EOF
 
     if [ "$with_npmrc" -eq 1 ] && [ -f "$HOME/.npmrc" ]; then
         mount_args+=(-v "$HOME/.npmrc:/home/nix/.npmrc:ro")
+        occupied_mount_dsts+=(/home/nix/.npmrc)
     fi
 
     # Shared expression dirs: mount each NAME=DIR read-only and expose it on
@@ -1209,6 +1372,7 @@ EOF
             # history modifier (strip the extension) plus a literal 'o', so
             # `common` mounted at `.../commono` and `my.lib` at `.../myo`.
             mount_args+=(-v "$expr_dir:/home/nix/.nix-shared-exprs/${expr_name}:ro")
+            occupied_mount_dsts+=("/home/nix/.nix-shared-exprs/$expr_name")
             expr_nix_path="${expr_nix_path:+$expr_nix_path:}$expr_name=/home/nix/.nix-shared-exprs/$expr_name"
         done
         env_args+=(-e "NIX_PATH=$expr_nix_path:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels")
@@ -1217,8 +1381,7 @@ EOF
     # Extra bind mounts: each HOST[:CONTAINER][:ro|:rw] spec mounts one more
     # host path into the container, read-write unless `:ro` says otherwise.
     if [ "${#mount_specs[@]}" -gt 0 ]; then
-        local mount_spec normalized_mount mount_dst seen_mount_dsts=":" project_dst
-        project_dst="/home/nix/$(basename "$PWD")"
+        local mount_spec normalized_mount mount_dst
         for mount_spec in "${mount_specs[@]}"; do
             normalized_mount=$(_nix_container_mount_spec "$mount_spec") || return 1
             # <src>:<dst>:<mode>, and neither path can contain a ':' (specs
@@ -1233,14 +1396,51 @@ EOF
                     return 1
                     ;;
             esac
-            case "$seen_mount_dsts" in
-                *":${mount_dst}:"*)
-                    echo "nix-container: --mount: duplicate container path: $mount_dst" >&2
-                    return 1
-                    ;;
-            esac
-            seen_mount_dsts="${seen_mount_dsts}${mount_dst}:"
+            if _nix_container_has_value "$mount_dst" "${occupied_mount_dsts[@]}"; then
+                echo "nix-container: --mount: duplicate container path: $mount_dst" >&2
+                return 1
+            fi
+            occupied_mount_dsts+=("$mount_dst")
             mount_args+=(-v "$normalized_mount")
+        done
+    fi
+
+    # Account for the optional AWS mounts before validating persistence below.
+    # Existing nested bind-mount behavior is otherwise left to the runtime.
+    if [ "$with_aws" -eq 1 ] && [ -f "$HOME/.aws/config" ]; then
+        occupied_mount_dsts+=(/home/nix/.aws/config)
+    fi
+    if [ "$with_aws" -eq 1 ] && [ -d "$HOME/.aws/sso/cache" ]; then
+        occupied_mount_dsts+=(/home/nix/.aws/sso/cache)
+    fi
+
+    # Persistence locations are container directories rather than host paths.
+    # Keep them normalized until volume names can be derived below. They cannot
+    # overlap an internal mount: nested mount ordering differs between runtimes,
+    # and locations inside the project already persist through its bind mount.
+    local -a persistence_paths=()
+    if [ "${#persistence_specs[@]}" -gt 0 ]; then
+        local persistence_spec persistence_path managed_path
+        for persistence_spec in "${persistence_specs[@]}"; do
+            persistence_path=$(_nix_container_persistence_path "$persistence_spec") || return 1
+            for managed_path in /nix /home/nix/.cache "$project_dst"; do
+                if _nix_container_paths_overlap "$persistence_path" "$managed_path"; then
+                    echo "nix-container: --persist: $persistence_path overlaps a location managed by nix-container ($managed_path)" >&2
+                    return 1
+                fi
+            done
+            for mount_dst in "${occupied_mount_dsts[@]}"; do
+                # Managed paths were diagnosed more specifically above.
+                case "$mount_dst" in
+                    /nix|/home/nix/.cache|"$project_dst") continue ;;
+                esac
+                if _nix_container_paths_overlap "$persistence_path" "$mount_dst"; then
+                    echo "nix-container: --persist: $persistence_path overlaps another mount ($mount_dst)" >&2
+                    return 1
+                fi
+            done
+            persistence_paths+=("$persistence_path")
+            occupied_mount_dsts+=("$persistence_path")
         done
     fi
 
@@ -1374,6 +1574,29 @@ EOF
                 return 1
             }
         fi
+    fi
+
+    # Each normalized location gets its own volume. Unlike cache volumes, its
+    # project key comes from the physical directory, not shell.nix, so changing
+    # the environment or rebuilding the image does not detach persistent data.
+    if [ "${#persistence_paths[@]}" -gt 0 ]; then
+        local physical_project persistence_project_hash persistence_path_hash persistence_volume
+        physical_project=$(pwd -P) || return 1
+        persistence_project_hash=$(_nix_container_string_hash "$physical_project") || return 1
+        for persistence_path in "${persistence_paths[@]}"; do
+            persistence_path_hash=$(_nix_container_string_hash "$persistence_path") || return 1
+            persistence_volume="nix-container-persist-$persistence_project_hash-$persistence_path_hash"
+            if ! "$cli" volume inspect "$persistence_volume" >/dev/null 2>&1; then
+                _nix_container_prepare_persistence_volume "$cli" "$persistence_volume" \
+                    "$persistence_path" "$(id -u):$(id -g)" || {
+                    echo "nix-container: failed to prepare persistence volume for $persistence_path" >&2
+                    return 1
+                }
+            fi
+            # Braces are required for zsh, where an unbraced variable followed
+            # by ':' can be parsed as a parameter-expansion modifier.
+            mount_args+=(-v "${persistence_volume}:$persistence_path")
+        done
     fi
 
     local dir

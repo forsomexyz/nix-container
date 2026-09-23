@@ -12,6 +12,8 @@ Nix on the host.
   Recurring options can live in a `nix-container.yml` next to it.
 - **Cache across runs.** The Nix store and CLI caches are persisted in named
   volumes so packages don't re-download every invocation.
+- **Persist tool state.** Opt-in container directories can use project-specific
+  named volumes, keeping their contents across otherwise ephemeral runs.
 
 ## Requirements
 
@@ -105,6 +107,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
 | `--with-shared-nix-exprs <name>=<dir>`  | Mount `<dir>` read-only and add it to `NIX_PATH` as `<name>`, so the project's nix files can `import <name>`. Repeatable. See [Sharing Nix expressions across projects](#sharing-nix-expressions-across-projects). |
 | `--mount <spec>`           | Bind-mount an extra host path into the container. `<spec>` is `host[:container][:ro\|:rw]`. Repeatable. See [Mounting extra directories](#mounting-extra-directories). |
+| `--persist <path>`         | Back a container directory with a project-specific named volume. Repeatable. See [Persisting container data](#persisting-container-data). |
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
@@ -131,6 +134,9 @@ ports:
 mounts:
   - ~/datasets:ro
   - ../shared-lib:/home/nix/shared-lib
+persistence:
+  - .local/share/my-tool
+  - /var/lib/postgres
 ```
 
 With that file in place, a bare `nix-container` behaves like:
@@ -138,16 +144,18 @@ With that file in place, a bare `nix-container` behaves like:
 ```sh
 nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
   --with-shared-nix-exprs common=~/nix-common --memory 4G -p 8080 -p 3000:3000 \
-  --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib
+  --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib \
+  --persist .local/share/my-tool --persist /var/lib/postgres
 ```
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
 may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
-accept `true`/`false`, `yes`/`no` and `on`/`off`. Ports may also be written
-inline (`ports: [8080, 3000:3000]`) or as a single value (`ports: 8080`).
-The file is parsed by the script itself, so no YAML tooling is needed on the
-host — which also means only this flat subset of YAML is understood. Quoted
-scalars must have a matching delimiter; embedded quote escapes are not
+accept `true`/`false`, `yes`/`no` and `on`/`off`. List options such as ports,
+mounts and persistence may also be written inline (`ports: [8080, 3000:3000]`)
+or as a single value (`ports: 8080`). The file is parsed by the script itself,
+so no YAML tooling is needed on the host — which also means only this flat
+subset of YAML is understood. Quoted scalars must have a matching delimiter;
+embedded quote escapes are not
 supported. Unknown keys and malformed values are reported with a line number
 and abort the run.
 
@@ -158,16 +166,18 @@ Precedence, highest first:
 3. Environment variables (`NIX_CONTAINER_MEMORY`, `NIX_CONTAINER_SHARED_NIX_EXPRS`).
 
 A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
-set in the file, and passing any `-p` (or `--mount`, `--with-shared-nix-exprs`)
-replaces *all* ports (or mounts, or shared expression dirs) from the file
-rather than adding to them. To ignore the file for a single run:
+set in the file, and passing any `-p` (or `--mount`, `--persist`,
+`--with-shared-nix-exprs`) replaces *all* ports (or mounts, persistence
+locations, or shared expression dirs) from the file rather than adding to
+them. To ignore the file for a single run:
 
 ```sh
 nix-container --no-config
 ```
 
-The file only configures how the container is run; it has no effect on the
-cache volumes, which are still keyed on the contents of `shell.nix`.
+The file does not change how cache volumes are keyed: those still follow the
+contents of `shell.nix`. Persistence volumes use the project directory and
+container location instead, so they stay attached when `shell.nix` changes.
 
 ### Mounting extra directories
 
@@ -212,6 +222,50 @@ Writes through a read-write mount are real writes to the host directory, and
 files created inside the container are owned by the host user (the image is
 built with the host's uid/gid). Mounts are not part of the [cache
 key](#how-caching-works) — only `shell.nix` is.
+
+### Persisting container data
+
+The container is removed after each run, so state written outside the
+bind-mounted project directory normally disappears. `--persist` backs a
+container directory with a named volume instead:
+
+```sh
+nix-container --persist .local/share/my-tool
+```
+
+Relative locations are placed under `/home/nix`; the example above therefore
+mounts at `/home/nix/.local/share/my-tool`. Absolute paths are accepted too,
+and `~` means the container user's home (an unquoted `~` expanded by the host
+shell is handled the same way). The option is repeatable:
+
+```sh
+nix-container --persist ~/.config/my-tool --persist /var/lib/postgres
+```
+
+The volume name (`nix-container-persist-<project-hash>-<location-hash>`) is
+derived from the physical project directory and normalized container path. As
+a result, each project and location has separate state, and the volume remains
+attached across subsequent `nix-container` runs, edits to
+`shell.nix`, image rebuilds, and `nix-container-clear-cache`. Moving the project
+to a different host path intentionally gives it a fresh set of volumes.
+Fresh volumes are initialized with any directory contents baked into the image
+and made writable by the container's `nix` user.
+
+The same locations can be kept in `nix-container.yml` (the singular key
+`persist` is accepted as an alias):
+
+```yaml
+persistence:
+  - .local/share/my-tool
+  - /var/lib/postgres
+```
+
+A persistence location cannot overlap `/nix`, `/home/nix/.cache`, the project
+mount, or another mount. The project directory itself is already persistent on
+the host; use [`--mount`](#mounting-extra-directories) instead when data should
+be directly accessible as host files rather than managed by the container
+runtime. Persistence volumes are deliberately not removed by
+`nix-container-clear-cache`, because they may contain user data.
 
 ### Sharing Nix expressions across projects
 
