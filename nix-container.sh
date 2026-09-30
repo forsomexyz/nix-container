@@ -218,6 +218,48 @@ _nix_container_persistence_path() {
     printf '%s\n' "$path"
 }
 
+# Staging root for persistence volumes whose location is nested inside the
+# container home. A volume cannot be mounted straight at, say,
+# /home/nix/.local/share/my-tool: the runtime creates the directories leading
+# up to a mount point itself, as root, so ~/.local and ~/.local/share would end
+# up owned by root and the container user could no longer write next to its own
+# data. Mounting under this root instead (whose own intermediate directories
+# nobody writes to) and symlinking the location into place at startup keeps
+# every directory in the home owned by the container user.
+_NIX_CONTAINER_PERSIST_ROOT=/home/nix/.nix-container-persist
+
+# Startup shim used when at least one persistence location is staged. It takes
+# the place of the image's nix-shell entrypoint, links each staged volume into
+# the home, and then hands over to nix-shell with the arguments that follow.
+# It needs no privileges: it only creates directories and symlinks inside the
+# container user's own home. $NIX_CONTAINER_PERSIST_LINKS is split on ':',
+# which persistence locations are validated not to contain; globbing is off
+# while splitting so no location is expanded. Anything already at a location
+# comes from the image and was copied into the volume when it was created, so
+# removing it here only touches the container's discarded layer.
+_NIX_CONTAINER_PERSIST_SHIM='
+set -f
+IFS=:
+for target in $NIX_CONTAINER_PERSIST_LINKS; do
+    staging="$NIX_CONTAINER_PERSIST_ROOT/${target#/home/nix/}"
+    if ! mkdir -p "${target%/*}"; then
+        echo "nix-container: cannot create the directories leading to persistence location $target" >&2
+        exit 1
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        rm -rf "$target" || exit 1
+    fi
+    if ! ln -s "$staging" "$target"; then
+        echo "nix-container: cannot link persistence location $target" >&2
+        exit 1
+    fi
+done
+unset IFS
+set +f
+unset NIX_CONTAINER_PERSIST_LINKS NIX_CONTAINER_PERSIST_ROOT target staging
+exec nix-shell "$@"
+'
+
 # Compute a short, portable hash for a string. Persistence volume names use
 # the physical project directory rather than shell.nix contents, so user data
 # remains attached after the Nix expression changes and cache volumes rotate.
@@ -1306,6 +1348,10 @@ EOF
 
     local -a env_args=()
     local -a mount_args=()
+    # Set only when a persistence location is staged: they replace the image's
+    # nix-shell entrypoint with the linking shim, which execs nix-shell itself.
+    local -a entrypoint_args=()
+    local -a entrypoint_cmd=()
     local project_dst="/home/nix/$(basename "$PWD")"
     local -a occupied_mount_dsts=(/nix /home/nix/.cache "$project_dst")
     if [ "$with_gh_token" -eq 1 ]; then
@@ -1395,6 +1441,10 @@ EOF
                     echo "nix-container: --mount: $mount_dst is mounted by nix-container already (the Nix store, its cache and the project directory cannot be remounted)" >&2
                     return 1
                     ;;
+                "$_NIX_CONTAINER_PERSIST_ROOT"|"$_NIX_CONTAINER_PERSIST_ROOT"/*)
+                    echo "nix-container: --mount: $_NIX_CONTAINER_PERSIST_ROOT is reserved for persistence volumes (--persist)" >&2
+                    return 1
+                    ;;
             esac
             if _nix_container_has_value "$mount_dst" "${occupied_mount_dsts[@]}"; then
                 echo "nix-container: --mount: duplicate container path: $mount_dst" >&2
@@ -1423,7 +1473,7 @@ EOF
         local persistence_spec persistence_path managed_path
         for persistence_spec in "${persistence_specs[@]}"; do
             persistence_path=$(_nix_container_persistence_path "$persistence_spec") || return 1
-            for managed_path in /nix /home/nix/.cache "$project_dst"; do
+            for managed_path in /nix /home/nix/.cache "$project_dst" "$_NIX_CONTAINER_PERSIST_ROOT"; do
                 if _nix_container_paths_overlap "$persistence_path" "$managed_path"; then
                     echo "nix-container: --persist: $persistence_path overlaps a location managed by nix-container ($managed_path)" >&2
                     return 1
@@ -1581,6 +1631,7 @@ EOF
     # the environment or rebuilding the image does not detach persistent data.
     if [ "${#persistence_paths[@]}" -gt 0 ]; then
         local physical_project persistence_project_hash persistence_path_hash persistence_volume
+        local persistence_mount persistence_links=""
         physical_project=$(pwd -P) || return 1
         persistence_project_hash=$(_nix_container_string_hash "$physical_project") || return 1
         for persistence_path in "${persistence_paths[@]}"; do
@@ -1593,10 +1644,32 @@ EOF
                     return 1
                 }
             fi
+            # A location nested inside the home is mounted under the staging
+            # root and symlinked into place by the shim, so the runtime never
+            # creates a root-owned directory in the home on the way to the
+            # mount point (see $_NIX_CONTAINER_PERSIST_ROOT). A location
+            # directly in the home needs no intermediate directory, and one
+            # outside it sits next to system directories that are root-owned
+            # anyway; both are mounted where they were asked for.
+            persistence_mount="$persistence_path"
+            case "$persistence_path" in
+                /home/nix/*/*)
+                    persistence_mount="$_NIX_CONTAINER_PERSIST_ROOT/${persistence_path#/home/nix/}"
+                    persistence_links="${persistence_links:+$persistence_links:}$persistence_path"
+                    ;;
+            esac
             # Braces are required for zsh, where an unbraced variable followed
             # by ':' can be parsed as a parameter-expansion modifier.
-            mount_args+=(-v "${persistence_volume}:$persistence_path")
+            mount_args+=(-v "${persistence_volume}:$persistence_mount")
         done
+        if [ -n "$persistence_links" ]; then
+            env_args+=(
+                -e "NIX_CONTAINER_PERSIST_ROOT=$_NIX_CONTAINER_PERSIST_ROOT"
+                -e "NIX_CONTAINER_PERSIST_LINKS=$persistence_links"
+            )
+            entrypoint_args=(--entrypoint sh)
+            entrypoint_cmd=(-c "$_NIX_CONTAINER_PERSIST_SHIM" nix-container)
+        fi
     fi
 
     local dir
@@ -1614,7 +1687,9 @@ EOF
         -v "nix-container-cache-$hash:/home/nix/.cache"
         -v "$PWD:/home/nix/$dir"
         -w "/home/nix/$dir"
+        "${entrypoint_args[@]}"
         nix-container:latest
+        "${entrypoint_cmd[@]}"
         --extra-experimental-features flakes
     )
 

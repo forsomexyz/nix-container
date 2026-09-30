@@ -215,7 +215,8 @@ A few things are rejected up front rather than at container startup: a host
 path that doesn't exist (docker would otherwise create it as a new root-owned
 directory that looks like an empty mount), two mounts landing on the same
 container path, and container paths that nix-container manages itself (`/nix`,
-`/home/nix/.cache` and the project directory). Host paths containing a `:`
+`/home/nix/.cache`, `/home/nix/.nix-container-persist` and the project
+directory). Host paths containing a `:`
 aren't supported, the same limitation `docker run -v` has.
 
 Writes through a read-write mount are real writes to the host directory, and
@@ -251,6 +252,19 @@ to a different host path intentionally gives it a fresh set of volumes.
 Fresh volumes are initialized with any directory contents baked into the image
 and made writable by the container's `nix` user.
 
+A location nested inside the container's home — `~/.local/share/my-tool`, but
+not `~/.npm` — is not mounted at that path directly. Container runtimes create
+the directories leading up to a mount point themselves, as `root`, which would
+leave `~/.local` and `~/.local/share` owned by `root` and unwritable for the
+container user. Such a volume is mounted under
+`/home/nix/.nix-container-persist/` (mirroring the path below the home)
+instead, and the location becomes a symlink to it, created at startup by the
+non-root container user along with its parent directories. The data and
+everything around it in the home therefore stay writable; only the location
+itself is a symlink rather than a real directory. Locations outside the home
+(`/var/lib/postgres`) are mounted where they were asked for, next to the
+root-owned system directories they belong to.
+
 The same locations can be kept in `nix-container.yml` (the singular key
 `persist` is accepted as an alias):
 
@@ -260,9 +274,10 @@ persistence:
   - /var/lib/postgres
 ```
 
-A persistence location cannot overlap `/nix`, `/home/nix/.cache`, the project
-mount, or another mount. The project directory itself is already persistent on
-the host; use [`--mount`](#mounting-extra-directories) instead when data should
+A persistence location cannot overlap `/nix`, `/home/nix/.cache`,
+`/home/nix/.nix-container-persist`, the project mount, or another mount. The
+project directory itself is already persistent on the host; use
+[`--mount`](#mounting-extra-directories) instead when data should
 be directly accessible as host files rather than managed by the container
 runtime. Persistence volumes are deliberately not removed by
 `nix-container-clear-cache`, because they may contain user data.

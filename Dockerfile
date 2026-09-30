@@ -16,6 +16,12 @@ RUN mkdir -p /home/nix/.aws/sso
 # directory as root.
 RUN mkdir -p /home/nix/.nix-shared-exprs
 
+# Staging root that volumes for nested --persist locations are mounted under.
+# Pre-created as `nix` for the same reason: the runtime would otherwise leave a
+# root-owned directory in the home. Only mount points live below it, which the
+# runtime creates itself.
+RUN mkdir -p /home/nix/.nix-container-persist
+
 ENV LC_ALL=C.UTF-8
 
 ENTRYPOINT ["nix-shell"]
