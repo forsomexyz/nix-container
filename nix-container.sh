@@ -752,7 +752,15 @@ _nix_container_prepare_persistence_volume() {
                 if [ -d "$1" ] && [ -z "$(ls -A /seed-persistence 2>/dev/null)" ]; then
                     cp -a "$1"/. /seed-persistence/
                 fi
-                chown -R "$2" /seed-persistence' \
+                chown -R "$2" /seed-persistence
+                # Mounting the volume shows the ownership of its root, so a
+                # runtime that ignores the chown would hand the container user
+                # a directory it cannot write to. Fail loudly instead.
+                got=$(stat -c %u:%g /seed-persistence)
+                if [ "$got" != "$2" ]; then
+                    echo "persistence volume stayed owned by $got instead of $2" >&2
+                    exit 1
+                fi' \
             _ "$location" "$owner"; then
         "$cli" volume rm "$volume" >/dev/null 2>&1
         return 1
