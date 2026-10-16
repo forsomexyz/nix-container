@@ -454,8 +454,8 @@ NIX_CONTAINER_CLI=container nix-container
 ### Using Apple's `container`
 
 The [`container`](https://github.com/apple/container) CLI is supported as an
-alternative to `docker`. It behaves differently from Docker in two ways that
-nix-container handles automatically, plus some one-time host setup:
+alternative to `docker`. Its backend handles differences from Docker
+automatically, plus some one-time host setup:
 
 One-time setup:
 
@@ -475,7 +475,11 @@ What nix-container does for you:
 - **Store seeding.** Docker populates a fresh named volume from the image's
   contents on first mount; `container` mounts an empty filesystem instead. Since
   the entire Nix installation lives under `/nix`, `nix-container` seeds a new
-  project's `/nix` store volume from the image on first run (a one-time copy).
+  project's `/nix` store volume from the image on first run (a one-time copy),
+  and assigns the cache volume to the host uid/gid so Nix can write to it.
+- **Session identity.** The backend supplies a numeric uid/gid and
+  `HOME=/home/nix` instead of relying on the image's named `USER nix`.
+  Root seeding helpers and the image builder keep their own identities.
 
 ### Clearing caches
 
@@ -567,7 +571,42 @@ image builds and interactive runtime behavior still require testing with an
 installed container runtime.
 
 The host implementation lives in `src/`: CLI/config parsing in `options.rs`,
-path and volume naming in `paths.rs`, runtime integration in `runtime.rs`, run
-planning in `run.rs`, and init/build/cache commands in `manage.rs`. Only the
+path and volume naming in `paths.rs`, shared process execution in `runtime.rs`,
+run planning in `run.rs`, and init/build/cache policy in `manage.rs`. Only the
 small container-side build and startup scripts remain shell, because they run
 inside the Nix image. `nix-container.sh` is optional compatibility glue.
+
+### Backend interface
+
+`src/backend/mod.rs` defines the application-specific `Backend` interface;
+`docker.rs` and `apple.rs` implement it. Application code passes a structured
+`RunPlan`, never runtime CLI flags or backend capability checks.
+
+| Operation | Contract |
+| --- | --- |
+| `preflight` | Check prerequisites without starting services or installing kernels. |
+| `image_id` | Return an opaque image identity, `None` for absence, or a runtime/inspection error. |
+| `build_images` | Build the builder, produce/import the backend's base archive, then build the session image. |
+| `prepare_run` | Prepare resources and return opaque `PreparedRun` state; never execute the user's command. |
+| `command` | Describe a session or probe process without spawning it. |
+| `list_volumes` | Enumerate names without deciding which contain disposable data. |
+| `remove_volume` | Non-forcing removal, distinguishing missing volumes from failures. |
+
+Apple owns service/kernel checks, explicit cache seeding, numeric session
+identity, and OCI archive selection. Docker uses native cache population and
+image identity. Private helpers in `backend/cli.rs` share CLI encoding, build
+sequencing, network setup, and persistence initialization/staging. Persistence
+helpers remain necessary on both backends, particularly when the seed source
+and staged mount path differ.
+
+Credentials, 1Password wrapping, terminal handling and signal forwarding stay
+in the common execution layer. Cache invalidation and the bounded stale-cache
+probe/retry remain application policy; recovery calls `prepare_run` again so
+each backend can restore its resources. Persistence volumes are never selected
+for automatic deletion.
+
+Preparation preserves the existing volume-existence readiness check. It is not
+transactional: a failed initialization can leave a volume that a later run
+reuses. Failed persistence volumes are retained to avoid deleting user data.
+Mock tests cover orchestration and argv; real runtime tests are still needed
+for filesystem ownership, copy-up and interactive terminal behavior.

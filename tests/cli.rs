@@ -20,6 +20,7 @@ impl Fixture {
         fs::write(dir.path().join("project/shell.nix"), "{}\n").unwrap();
         let f = Self { dir };
         f.script("docker", include_str!("mock-runtime.sh"));
+        f.script("container", include_str!("mock-runtime.sh"));
         f
     }
     fn path(&self, path: &str) -> std::path::PathBuf {
@@ -67,12 +68,27 @@ impl Fixture {
         fs::read_to_string(self.path("events")).unwrap_or_default()
     }
     fn argv(&self) -> Vec<String> {
-        fs::read(self.path("argv"))
+        self.read_argv("argv")
+    }
+    fn read_argv(&self, name: &str) -> Vec<String> {
+        fs::read(self.path(name))
             .unwrap()
             .split(|b| *b == 0)
             .filter(|b| !b.is_empty())
             .map(|b| String::from_utf8(b.to_vec()).unwrap())
             .collect()
+    }
+    fn runs(&self) -> Vec<Vec<String>> {
+        (0..)
+            .map(|n| format!("run-argv-{n}"))
+            .take_while(|name| self.path(name).exists())
+            .map(|name| self.read_argv(&name))
+            .collect()
+    }
+    fn backend(&self, cli: &str) -> Command {
+        let mut command = self.cmd();
+        command.env("NIX_CONTAINER_CLI", self.path(&format!("bin/{cli}")));
+        command
     }
 }
 fn pair(args: &[String], flag: &str, value: &str) -> bool {
@@ -136,7 +152,7 @@ fn with_stderr_pty(
 #[test]
 fn spinner_clears_before_container_output_or_error() {
     let f = Fixture::new();
-    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; exit 0; fi\nif [ \"$1\" = run ]; then echo shell-ready >&2; exit 0; fi\nexit 0\n");
+    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; echo image-id; exit 0; fi\nif [ \"$1\" = run ]; then echo shell-ready >&2; exit 0; fi\nexit 0\n");
     let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
     assert!(status.success(), "{output}");
     assert!(output.contains("N I X   C O N T A I N E R"), "{output:?}");
@@ -147,7 +163,7 @@ fn spinner_clears_before_container_output_or_error() {
 
     f.script(
         "docker",
-        "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; exit 1; fi\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; echo 'No such image' >&2; exit 1; fi\nexit 0\n",
     );
     let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
     assert!(!status.success());
@@ -157,7 +173,7 @@ fn spinner_clears_before_container_output_or_error() {
         "{output:?}"
     );
 
-    let (status, output) = with_stderr_pty(&mut f.cmd().args(["run", "true"]), 24, 80);
+    let (status, output) = with_stderr_pty(f.cmd().args(["run", "true"]), 24, 80);
     assert!(!status.success());
     assert!(!output.contains("✦"));
 
@@ -170,7 +186,7 @@ fn spinner_clears_before_container_output_or_error() {
 #[test]
 fn termination_signal_reaches_runtime() {
     let f = Fixture::new();
-    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then exit 0; fi\ntrap 'exit 143' TERM\ntouch \"$MOCK_ROOT/ready\"\nwhile :; do sleep 0.05; done\n");
+    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then echo image-id; exit 0; fi\ntrap 'exit 143' TERM\ntouch \"$MOCK_ROOT/ready\"\nwhile :; do sleep 0.05; done\n");
     let mut child = f
         .cmd()
         .args(["run", "sleep", "60"])
@@ -218,19 +234,22 @@ fn aws_cli_resets_config_profile_and_accepts_literal_boolean_profile() {
 
 #[test]
 fn existing_network_regressions() {
-    let out = Command::new("bash")
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-network.sh"))
-        .env("NIX_CONTAINER_BIN", env!("CARGO_BIN_EXE_nix-container"))
-        .env_remove("NIX_CONTAINER_MEMORY")
-        .env_remove("NIX_CONTAINER_SHARED_NIX_EXPRS")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "stdout: {}\nstderr: {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
+    for cli in ["mock-container", "container"] {
+        let out = Command::new("bash")
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test-network.sh"))
+            .env("NIX_CONTAINER_BIN", env!("CARGO_BIN_EXE_nix-container"))
+            .env("MOCK_CLI_NAME", cli)
+            .env_remove("NIX_CONTAINER_MEMORY")
+            .env_remove("NIX_CONTAINER_SHARED_NIX_EXPRS")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{cli}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }
 
 #[test]
@@ -338,36 +357,49 @@ fn credentials_are_environment_only_and_op_wraps_launch() {
         "PASSWORD=op://vault/item/password\n",
     )
     .unwrap();
-    f.ok(&[
-        "--with-gh-token",
-        "--with-aws=dev",
-        "--with-env",
-        ".env",
-        "run",
-        "true",
-    ]);
-    let args = f.argv();
-    for key in [
-        "GH_TOKEN",
-        "AWS_ACCESS_KEY_ID",
-        "AWS_SECRET_ACCESS_KEY",
-        "AWS_PROFILE",
-        "PASSWORD",
-    ] {
-        assert!(pair(&args, "-e", key));
+    for cli in ["docker", "container"] {
+        let out = f
+            .backend(cli)
+            .args([
+                "--with-gh-token",
+                "--with-aws=dev",
+                "--with-env",
+                ".env",
+                "run",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let args = f.argv();
+        for key in [
+            "GH_TOKEN",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_PROFILE",
+            "PASSWORD",
+        ] {
+            assert!(pair(&args, "-e", key));
+        }
+        for run in f.runs() {
+            for secret in [
+                "github-secret",
+                "access-secret",
+                "secret-key",
+                "resolved-secret",
+            ] {
+                assert!(!run.join(" ").contains(secret));
+            }
+        }
+        assert_eq!(
+            fs::read_to_string(f.path("credentials")).unwrap(),
+            "github-secret|access-secret|secret-key|dev|resolved-secret"
+        );
     }
-    for secret in [
-        "github-secret",
-        "access-secret",
-        "secret-key",
-        "resolved-secret",
-    ] {
-        assert!(!args.join(" ").contains(secret));
-    }
-    assert_eq!(
-        fs::read_to_string(f.path("credentials")).unwrap(),
-        "github-secret|access-secret|secret-key|dev|resolved-secret"
-    );
 }
 
 #[test]
@@ -485,10 +517,339 @@ fn build_uses_embedded_assets_and_invalidates_only_caches() {
         } else {
             "IMAGE_FORMAT=docker"
         }));
+        let load = log.lines().find(|line| line.starts_with("load ")).unwrap();
+        assert!(load.ends_with(if apple {
+            "image-oci.tar"
+        } else {
+            "image.tar.gz"
+        }));
+        let builder = &f.runs()[0];
+        assert!(!builder.contains(&"--user".into()));
+        assert!(!pair(builder, "-e", "HOME=/home/nix"));
         assert!(!f.path("volumes/nix-container-store-old").exists());
         assert!(f.path("volumes/nix-container-persist-keep").exists());
         assert!(f.path("volumes/unrelated").exists());
     }
+}
+
+#[test]
+fn build_retains_unchanged_or_in_use_caches() {
+    for cli in ["docker", "container"] {
+        for unchanged in [false, true] {
+            let f = Fixture::new();
+            fs::write(f.path("volumes/nix-container-store-old"), "cache").unwrap();
+            if unchanged {
+                fs::write(f.path("loaded"), "").unwrap();
+            }
+            let out = f
+                .backend(cli)
+                .env("MOCK_REMOVE_FAIL", if unchanged { "0" } else { "1" })
+                .arg("build")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(
+                fs::read_to_string(f.path("volumes/nix-container-store-old")).unwrap(),
+                "cache"
+            );
+            if unchanged {
+                assert!(!String::from_utf8_lossy(&out.stdout).contains("invalidated"));
+            } else {
+                assert!(String::from_utf8_lossy(&out.stderr).contains("volume is in use"));
+            }
+        }
+    }
+}
+
+#[test]
+fn backends_prepare_persistence_and_keep_helper_identity_separate() {
+    for cli in ["docker", "container"] {
+        let f = Fixture::new();
+        for _ in 0..2 {
+            let out = f
+                .backend(cli)
+                .args([
+                    "--persist",
+                    ".local/share/tool",
+                    "--persist",
+                    "/var/lib/db",
+                    "run",
+                    "true",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        assert_eq!(f.log().matches("seed-persistence").count(), 2);
+        assert_eq!(
+            f.log().matches("seed-cache").count(),
+            usize::from(cli == "container")
+        );
+        let args = f.argv();
+        assert!(pair(&args, "--entrypoint", "sh"));
+        assert!(pair(
+            &args,
+            "-e",
+            "NIX_CONTAINER_PERSIST_LINKS=/home/nix/.local/share/tool"
+        ));
+        assert!(args
+            .iter()
+            .any(|s| s.ends_with(":/home/nix/.nix-container-persist/.local/share/tool")));
+        assert!(args.iter().any(|s| s.ends_with(":/var/lib/db")));
+        assert_eq!(args.contains(&"--user".into()), cli == "container");
+        assert_eq!(pair(&args, "-e", "HOME=/home/nix"), cli == "container");
+        for helper in f
+            .runs()
+            .iter()
+            .filter(|args| args.iter().any(|s| s.contains(":/seed-")))
+        {
+            assert!(pair(helper, "--user", "0"));
+            assert!(pair(helper, "--entrypoint", "sh"));
+            assert!(!pair(helper, "-e", "HOME=/home/nix"));
+            assert!(!helper
+                .iter()
+                .any(|s| matches!(s.as_str(), "-i" | "-t" | "-it")));
+            if helper.iter().any(|s| s.ends_with(":/seed-persistence")) {
+                assert!(
+                    helper.contains(&"/home/nix/.local/share/tool".into())
+                        || helper.contains(&"/var/lib/db".into())
+                );
+            } else {
+                assert!(helper.iter().any(|s| s.ends_with(":/seed-nix")));
+                assert!(helper.iter().any(|s| s.ends_with(":/seed-cache")));
+                assert!(!helper.iter().any(|s| s.ends_with(":/nix")));
+            }
+        }
+    }
+}
+
+#[test]
+fn apple_reseeds_when_either_cache_is_missing() {
+    for prefix in ["nix-container-store-", "nix-container-cache-"] {
+        let f = Fixture::new();
+        assert!(f
+            .backend("container")
+            .args(["run", "true"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let volume = fs::read_dir(f.path("volumes"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .unwrap();
+        fs::remove_file(volume.path()).unwrap();
+        assert!(f
+            .backend("container")
+            .args(["run", "true"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(volume.path().exists());
+        assert_eq!(f.log().matches("seed-cache").count(), 2);
+    }
+}
+
+#[test]
+fn failed_preparation_never_launches_session_or_deletes_persistence() {
+    for cli in ["docker", "container"] {
+        let f = Fixture::new();
+        // Prepare caches first so a subsequent failure is in persistence setup.
+        assert!(f
+            .backend(cli)
+            .args(["run", "true"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let launches = f.log().matches("launch").count();
+        let out = f
+            .backend(cli)
+            .env("MOCK_SEED_FAIL", "1")
+            .args(["--persist", ".local/share/tool", "run", "true"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("volume retained"));
+        assert_eq!(f.log().matches("launch").count(), launches);
+        let volume = fs::read_dir(f.path("volumes"))
+            .unwrap()
+            .map(|e| e.unwrap())
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("nix-container-persist-")
+            })
+            .unwrap();
+        fs::write(volume.path(), "user data").unwrap();
+        assert!(f
+            .backend(cli)
+            .args(["clear-cache", "--all"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert_eq!(fs::read_to_string(volume.path()).unwrap(), "user data");
+    }
+    let f = Fixture::new();
+    let out = f
+        .backend("container")
+        .env("MOCK_SEED_FAIL", "1")
+        .args(["run", "true"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("failed to prepare the /nix"));
+    assert!(!f.log().contains("launch"));
+}
+
+#[test]
+fn both_backends_probe_safely_and_retry_only_after_successful_cache_removal() {
+    for cli in ["docker", "container"] {
+        for remove_fails in [false, true] {
+            let f = Fixture::new();
+            let out = f
+                .backend(cli)
+                .env("MOCK_STALE", "1")
+                .env("MOCK_REMOVE_FAIL", if remove_fails { "1" } else { "0" })
+                .args(["--persist", ".local/share/tool", "run", "user-command"])
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.success(),
+                !remove_fails,
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let runs = f.runs();
+            let sessions: Vec<_> = runs
+                .iter()
+                .filter(|args| args.contains(&"--name".into()))
+                .collect();
+            assert_eq!(sessions.len(), if remove_fails { 2 } else { 3 });
+            assert_eq!(sessions[0].last().unwrap(), "'user-command'");
+            assert_eq!(sessions[1].last().unwrap(), "'true'");
+            assert!(!sessions[1]
+                .iter()
+                .any(|s| matches!(s.as_str(), "-i" | "-t" | "-it")));
+            assert!(pair(sessions[1], "--entrypoint", "sh"));
+            assert_eq!(
+                pair(sessions[1], "-e", "HOME=/home/nix"),
+                cli == "container"
+            );
+            if !remove_fails {
+                assert_eq!(sessions[2].last().unwrap(), "'user-command'");
+            }
+            assert_eq!(f.log().matches("seed-persistence").count(), 1);
+            assert_eq!(
+                f.log().matches("seed-cache").count(),
+                if cli == "container" {
+                    if remove_fails {
+                        1
+                    } else {
+                        2
+                    }
+                } else {
+                    0
+                }
+            );
+            assert!(!f
+                .log()
+                .lines()
+                .any(|l| l.starts_with("remove nix-container-persist-")));
+        }
+    }
+}
+
+#[test]
+fn missing_images_and_runtime_failures_are_distinct() {
+    for cli in ["docker", "container"] {
+        for (mode, message) in [
+            ("missing", "Run 'nix-container build'"),
+            ("error", "cannot connect to runtime"),
+            ("service", "image service not found"),
+        ] {
+            let f = Fixture::new();
+            let out = f
+                .backend(cli)
+                .env("MOCK_IMAGE", mode)
+                .args(["run", "true"])
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            let error = String::from_utf8_lossy(&out.stderr);
+            assert!(error.contains(message), "{error}");
+            if mode != "missing" {
+                assert!(!error.contains("Run 'nix-container build'"));
+            }
+            assert!(f.runs().is_empty());
+        }
+    }
+    let f = Fixture::new();
+    let out = f
+        .backend("container")
+        .env("MOCK_IMAGE", "malformed")
+        .args(["run", "true"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("returned no ID"));
+}
+
+#[test]
+fn clear_cache_needs_no_guest_kernel_and_propagates_removal_errors() {
+    for cli in ["docker", "container"] {
+        let f = Fixture::new();
+        let out = f
+            .backend(cli)
+            .env("MOCK_STOPPED", "1")
+            .env("MOCK_NO_KERNEL", "1")
+            .arg("clear-cache")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(String::from_utf8_lossy(&out.stdout).contains("does not exist, skipping"));
+        fs::write(f.path("volumes/nix-container-store-old"), "cache").unwrap();
+        let out = f
+            .backend(cli)
+            .env("MOCK_REMOVE_FAIL", "1")
+            .args(["clear-cache", "--all"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("volume is in use"));
+        assert!(f.path("volumes/nix-container-store-old").exists());
+        let out = f
+            .backend(cli)
+            .env("MOCK_VOLUME_ERROR", "1")
+            .args(["clear-cache", "--all"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("permission denied"));
+    }
+    let f = Fixture::new();
+    let out = f
+        .backend("container")
+        .env("MOCK_NO_KERNEL", "1")
+        .args(["run", "true"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("container system kernel set --recommended")
+    );
+    assert!(f.runs().is_empty());
 }
 
 #[test]

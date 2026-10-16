@@ -6,14 +6,24 @@ repo_dir=$(cd "$(dirname "$0")/.." && pwd)
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/project"
-cat > "$tmp/bin/mock-container" <<'EOF'
+cli_name=${MOCK_CLI_NAME:-mock-container}
+cat > "$tmp/bin/$cli_name" <<'EOF'
 #!/usr/bin/env bash
 case "$1 $2" in
-    'image inspect') exit 0 ;;
+    'system status') printf '{"status":"running"}'; exit 0 ;;
+    'system property') printf '{"kernel":{"binaryPath":"/kernel"}}'; exit 0 ;;
+    'volume inspect') exit 0 ;; # caches already prepared
+    'image inspect')
+        case "$*" in
+            *--format*) printf 'image-id\n' ;;
+            *) printf '[{"id":"image-id"}]' ;;
+        esac
+        exit 0 ;;
     'network inspect')
         printf 'inspect %s\n' "$3" >> "$MOCK_EVENTS"
-        [ -f "$MOCK_NETWORKS/$3" ]
-        exit $?
+        [ ! -f "$MOCK_NETWORKS/$3" ] || exit 0
+        echo 'No such network' >&2
+        exit 1
         ;;
     'network create')
         printf 'create %s\n' "$3" >> "$MOCK_EVENTS"
@@ -33,9 +43,9 @@ if [ "$1" = run ]; then
 fi
 exit 1
 EOF
-chmod +x "$tmp/bin/mock-container"
+chmod +x "$tmp/bin/$cli_name"
 mkdir -p "$tmp/networks"
-export PATH="$tmp/bin:$PATH" NIX_CONTAINER_CLI=mock-container MOCK_LOG="$tmp/argv"
+export PATH="$tmp/bin:$PATH" NIX_CONTAINER_CLI="$cli_name" MOCK_LOG="$tmp/argv"
 export MOCK_NETWORKS="$tmp/networks" MOCK_EVENTS="$tmp/events"
 cd "$tmp/project"
 printf '{}\n' > shell.nix

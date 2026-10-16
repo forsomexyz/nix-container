@@ -47,11 +47,6 @@ pub struct Mount {
     pub target: String,
     pub mode: String,
 }
-impl Mount {
-    pub fn spec(&self) -> String {
-        format!("{}:{}:{}", self.source.display(), self.target, self.mode)
-    }
-}
 
 pub fn mount(spec: &str, home: &Path) -> Result<Mount> {
     let parts: Vec<_> = spec.split(':').collect();
@@ -153,12 +148,6 @@ pub fn loopback(original: &str) -> Result<String> {
         bail!("invalid port specification: {original}");
     }
     Ok(format!("127.0.0.1:{rest}{proto}"))
-}
-
-pub fn network_mode(network: &str) -> bool {
-    matches!(network, "bridge" | "host" | "none" | "default")
-        || network.starts_with("container:")
-        || network.starts_with("ns:")
 }
 
 pub fn valid_name(name: &str) -> bool {

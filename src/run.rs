@@ -1,7 +1,10 @@
 use crate::{
+    backend::{
+        self, BindMount, Environment, Identity, PersistenceVolume, RunInvocation, RunPlan, IMAGE,
+    },
     options::{self, Invocation, Options},
     paths::{self, HOME, PERSIST_ROOT},
-    runtime::{self, Runtime, IMAGE},
+    runtime,
 };
 use anyhow::{bail, Context, Result};
 use std::{
@@ -17,11 +20,6 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-
-fn pair(args: &mut Vec<String>, flag: &str, value: impl Into<String>) {
-    args.push(flag.into());
-    args.push(value.into());
-}
 
 const ANIMATION_HEIGHT: usize = 5;
 const TRAIL_WIDTH: usize = 24;
@@ -118,13 +116,9 @@ impl Drop for Spinner {
 }
 
 struct Plan {
-    args: Vec<String>,
+    run: RunPlan,
     credentials: BTreeMap<String, String>,
     op_file: Option<String>,
-    persistence: Vec<(String, String)>,
-    store: String,
-    cache: String,
-    network: String,
 }
 
 impl Plan {
@@ -146,7 +140,9 @@ impl Plan {
         {
             bail!("project directory conflicts with a managed mount: {project_dst}");
         }
-        let mut args = vec!["--rm".into(), "--name".into(), name.into()];
+        let mut binds = Vec::new();
+        let mut environment = Vec::new();
+        let mut env_file = None;
         let mut occupied = vec![
             "/nix".into(),
             "/home/nix/.cache".into(),
@@ -159,15 +155,12 @@ impl Plan {
             if !options::valid_memory(memory) {
                 bail!("--memory: invalid memory size: {memory}");
             }
-            pair(&mut args, "--memory", memory);
         }
-        let network = options.get("network").unwrap_or_default();
-        if !network.is_empty() {
-            pair(&mut args, "--network", network);
-        }
-        for port in options.list("ports") {
-            pair(&mut args, "-p", paths::loopback(port)?);
-        }
+        let ports = options
+            .list("ports")
+            .iter()
+            .map(|p| paths::loopback(p))
+            .collect::<Result<Vec<_>>>()?;
         let aws = options.enabled("with-aws");
         let mut optional_mount = |source: PathBuf, target: &str, readonly: bool| -> Result<()> {
             if source.exists() {
@@ -177,15 +170,11 @@ impl Plan {
                 if occupied.iter().any(|p| paths::overlaps(p, target)) {
                     bail!("optional mount overlaps another mount: {target}");
                 }
-                pair(
-                    &mut args,
-                    "-v",
-                    format!(
-                        "{}:{target}{}",
-                        source.display(),
-                        if readonly { ":ro" } else { "" }
-                    ),
-                );
+                binds.push(BindMount {
+                    source,
+                    target: target.into(),
+                    readonly,
+                });
                 occupied.push(target.into());
             }
             Ok(())
@@ -228,12 +217,16 @@ impl Plan {
             if occupied.iter().any(|p| paths::overlaps(p, &target)) {
                 bail!("shared expression mount overlaps another mount: {target}");
             }
-            pair(&mut args, "-v", format!("{}:{target}:ro", dir.display()));
+            binds.push(BindMount {
+                source: dir,
+                target: target.clone(),
+                readonly: true,
+            });
             nix_path.push(format!("{name}={target}"));
             occupied.push(target);
         }
         if !nix_path.is_empty() {
-            pair(&mut args, "-e", format!("NIX_PATH={}:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels", nix_path.join(":")));
+            environment.push(Environment::Value("NIX_PATH".into(), format!("{}:/nix/var/nix/profiles/per-user/nix/channels:/home/nix/.nix-defexpr/channels", nix_path.join(":"))));
         }
         for spec in options.list("mounts") {
             let mount = paths::mount(spec, &home)?;
@@ -243,12 +236,15 @@ impl Plan {
                     mount.target
                 );
             }
-            pair(&mut args, "-v", mount.spec());
-            occupied.push(mount.target);
+            occupied.push(mount.target.clone());
+            binds.push(BindMount {
+                source: mount.source,
+                target: mount.target,
+                readonly: mount.mode == "ro",
+            });
         }
         let project_hash = paths::hash(project.as_os_str().as_encoded_bytes());
         let mut persistence = Vec::new();
-        let mut links = Vec::new();
         for spec in options.list("persistence") {
             let location = paths::persistence(spec, &home)?;
             if let Some(other) = occupied.iter().find(|p| paths::overlaps(p, &location)) {
@@ -258,13 +254,11 @@ impl Plan {
                 "nix-container-persist-{project_hash}-{}",
                 paths::hash(&location)
             );
-            let target = paths::staging(&location).unwrap_or_else(|| location.clone());
-            if target != location {
-                links.push(location.clone());
-            }
-            pair(&mut args, "-v", format!("{volume}:{target}"));
             occupied.push(location.clone());
-            persistence.push((volume, location));
+            persistence.push(PersistenceVolume {
+                name: volume,
+                location,
+            });
         }
         // Resolve credentials only after validating the plan. Values are passed in the
         // child environment, never in argv and never exported into the caller's shell.
@@ -275,7 +269,7 @@ impl Plan {
                 bail!("failed to get token from 'gh auth token'");
             }
             credentials.insert("GH_TOKEN".into(), token);
-            pair(&mut args, "-e", "GH_TOKEN");
+            environment.push(Environment::Forward("GH_TOKEN".into()));
         }
         if aws {
             let profile = options.get("aws-profile").filter(|p| !p.is_empty());
@@ -302,13 +296,13 @@ impl Plan {
                     bail!("--with-aws: invalid environment variable name");
                 }
                 credentials.insert(name.into(), value.into());
-                pair(&mut args, "-e", name);
+                environment.push(Environment::Forward(name.into()));
             }
             if let Some(profile) = profile {
                 credentials.insert("AWS_PROFILE".into(), profile.into());
-                pair(&mut args, "-e", "AWS_PROFILE");
+                environment.push(Environment::Forward("AWS_PROFILE".into()));
             } else if env::var_os("AWS_PROFILE").is_some() {
-                pair(&mut args, "-e", "AWS_PROFILE");
+                environment.push(Environment::Forward("AWS_PROFILE".into()));
             }
         }
         if let Some(file) = options.get("with-env") {
@@ -330,91 +324,59 @@ impl Plan {
                         if !paths::valid_env(name) {
                             bail!("invalid environment variable name in {}", file.display());
                         }
-                        pair(&mut args, "-e", name);
+                        environment.push(Environment::Forward(name.into()));
                     }
                 }
                 op_file = Some(file.to_string_lossy().into());
             } else {
-                pair(&mut args, "--env-file", file.to_string_lossy());
+                env_file = Some(file);
             }
         }
-        let store = format!("nix-container-store-{hash}");
-        let cache = format!("nix-container-cache-{hash}");
-        pair(&mut args, "-v", format!("{store}:/nix"));
-        pair(&mut args, "-v", format!("{cache}:{HOME}/.cache"));
-        pair(
-            &mut args,
-            "-v",
-            format!("{}:{project_dst}", project.display()),
-        );
-        pair(&mut args, "-w", project_dst);
-        if !links.is_empty() {
-            pair(
-                &mut args,
-                "-e",
-                format!("NIX_CONTAINER_PERSIST_ROOT={PERSIST_ROOT}"),
-            );
-            pair(
-                &mut args,
-                "-e",
-                format!("NIX_CONTAINER_PERSIST_LINKS={}", links.join(":")),
-            );
-            pair(&mut args, "--entrypoint", "sh");
-        }
-        args.push(IMAGE.into());
-        if !links.is_empty() {
-            args.extend([
-                "-c".into(),
-                include_str!("../assets/persist.sh").into(),
-                "nix-container".into(),
-            ]);
-        }
-        args.extend(["--extra-experimental-features".into(), "flakes".into()]);
+        binds.push(BindMount {
+            source: project.clone(),
+            target: project_dst.clone(),
+            readonly: false,
+        });
         Ok(Self {
-            args,
+            run: RunPlan {
+                image: IMAGE.into(),
+                name: name.into(),
+                identity: Identity::host(),
+                home: HOME.into(),
+                workdir: project_dst,
+                binds,
+                store: format!("nix-container-store-{hash}"),
+                cache: format!("nix-container-cache-{hash}"),
+                persistence,
+                memory: options.get("memory").map(str::to_owned),
+                network: options.get("network").map(str::to_owned),
+                ports,
+                env: environment,
+                env_file,
+            },
             credentials,
             op_file,
-            persistence,
-            store,
-            cache,
-            network: network.into(),
         })
     }
-    fn argv(&self, runtime: &Runtime, command: Option<&[String]>, tty: bool) -> Vec<String> {
-        let mut args = vec!["run".into()];
-        if tty {
-            if command.is_none() {
-                args.push("-it".into());
-            } else {
-                if io::stdin().is_terminal() {
-                    args.push("-i".into());
-                }
-                if io::stdin().is_terminal() && io::stdout().is_terminal() {
-                    args.push("-t".into());
-                }
-            }
-        }
-        if runtime.apple {
-            args.extend([
-                "--user".into(),
-                runtime::owner(),
-                "-e".into(),
-                format!("HOME={HOME}"),
-            ]);
-        }
-        args.extend(self.args.clone());
-        if let Some(command) = command {
-            pair(
-                &mut args,
-                "--run",
-                command
-                    .iter()
-                    .map(|s| paths::quote(s))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
-        }
-        args
+}
+
+fn shell_invocation(command: Option<&[String]>, terminal: bool) -> RunInvocation {
+    let mut args = vec!["--extra-experimental-features".into(), "flakes".into()];
+    if let Some(command) = command {
+        args.push("--run".into());
+        args.push(
+            command
+                .iter()
+                .map(|s| paths::quote(s))
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
+    }
+    RunInvocation {
+        args,
+        attach_stdin: terminal && (command.is_none() || io::stdin().is_terminal()),
+        tty: terminal
+            && (command.is_none() || (io::stdin().is_terminal() && io::stdout().is_terminal())),
     }
 }
 
@@ -422,27 +384,24 @@ pub fn run(invocation: Invocation) -> Result<i32> {
     let mut spinner = Spinner::start(invocation.command.is_none());
     let options = options::load(&invocation)?;
     let plan = Plan::new(&options)?;
-    let runtime = Runtime::detect()?;
-    runtime.preflight()?;
-    if !runtime.exists("image", IMAGE) {
+    let backend = backend::detect()?;
+    backend.preflight()?;
+    if backend.image_id(IMAGE)?.is_none() {
         bail!("image {IMAGE} not found. Run 'nix-container build' to build it.");
     }
     // Seeding and network creation can print diagnostics; let them own the terminal.
     spinner.stop();
-    runtime.seed_cache(&plan.store, &plan.cache)?;
-    for (volume, location) in &plan.persistence {
-        runtime.seed_persistence(volume, location)?;
-    }
-    runtime.network(&plan.network)?;
-    let args = plan.argv(&runtime, invocation.command.as_deref(), true);
+    let prepared = backend.prepare_run(&plan.run)?;
+    let session = shell_invocation(invocation.command.as_deref(), true);
+    let command = backend.command(&prepared, &session)?;
     let start = Instant::now();
-    let code =
-        runtime::wait(&mut runtime.launch(&args, &plan.credentials, plan.op_file.as_deref()))?;
+    let code = runtime::wait(&mut command.launch(&plan.credentials, plan.op_file.as_deref()))?;
     if code != 0 && code < 128 && start.elapsed() < Duration::from_secs(3) {
         // Probe nix-shell only, never repeat the user's command during diagnosis.
-        let probe = plan.argv(&runtime, Some(&["true".into()]), false);
-        let output = runtime
-            .launch(&probe, &plan.credentials, plan.op_file.as_deref())
+        let probe = shell_invocation(Some(&["true".into()]), false);
+        let output = backend
+            .command(&prepared, &probe)?
+            .launch(&plan.credentials, plan.op_file.as_deref())
             .stdin(Stdio::null())
             .output()?;
         if [output.stdout, output.stderr]
@@ -453,18 +412,18 @@ pub fn run(invocation: Invocation) -> Result<i32> {
             eprintln!(
                 "nix-container: stale cache detected for this project, clearing and retrying..."
             );
-            for volume in [&plan.store, &plan.cache] {
-                if runtime.exists("volume", volume) && !runtime.quiet(&["volume", "rm", volume])? {
-                    eprintln!("nix-container: cannot clear cache while other sessions are open; exit those sessions and re-run");
+            for volume in [&plan.run.store, &plan.run.cache] {
+                if let Err(error) = backend.remove_volume(volume) {
+                    eprintln!("nix-container: cannot clear cache: {error:#}; exit other sessions and re-run");
                     return Ok(code);
                 }
             }
-            runtime.seed_cache(&plan.store, &plan.cache)?;
-            return runtime::wait(&mut runtime.launch(
-                &args,
-                &plan.credentials,
-                plan.op_file.as_deref(),
-            ));
+            let prepared = backend.prepare_run(&plan.run)?;
+            return runtime::wait(
+                &mut backend
+                    .command(&prepared, &session)?
+                    .launch(&plan.credentials, plan.op_file.as_deref()),
+            );
         }
     }
     Ok(code)

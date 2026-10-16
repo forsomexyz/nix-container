@@ -1,6 +1,7 @@
 #[cfg(not(unix))]
 compile_error!("nix-container supports Unix hosts (Linux and macOS)");
 
+mod backend;
 mod manage;
 mod options;
 mod paths;

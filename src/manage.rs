@@ -1,6 +1,6 @@
 use crate::{
+    backend::{self, Backend, BuildSpec, Identity, RemoveOutcome, BASE},
     paths,
-    runtime::{Runtime, BASE},
 };
 use anyhow::{bail, Context, Result};
 use std::{
@@ -21,10 +21,20 @@ pub fn init(force: bool) -> Result<()> {
     Ok(())
 }
 
+fn cache_volumes(backend: &dyn Backend) -> Result<Vec<String>> {
+    Ok(backend
+        .list_volumes()?
+        .into_iter()
+        .filter(|name| {
+            name.starts_with("nix-container-store-") || name.starts_with("nix-container-cache-")
+        })
+        .collect())
+}
+
 pub fn clear_cache(all: bool) -> Result<()> {
-    let runtime = Runtime::detect()?;
+    let backend = backend::detect()?;
     let volumes = if all {
-        runtime.cache_volumes()?
+        cache_volumes(backend.as_ref())?
     } else {
         let hash = paths::project_hash().context("use --all to clear all caches")?;
         vec![
@@ -36,9 +46,7 @@ pub fn clear_cache(all: bool) -> Result<()> {
         println!("nix-container: no nix-container caches found");
     }
     for volume in volumes {
-        if runtime.exists("volume", &volume) {
-            runtime.checked(&["volume", "rm", &volume])?;
-        } else {
+        if backend.remove_volume(&volume)? == RemoveOutcome::Missing {
             println!("nix-container: volume {volume} does not exist, skipping");
         }
     }
@@ -46,9 +54,9 @@ pub fn clear_cache(all: bool) -> Result<()> {
 }
 
 pub fn build(no_cache: bool) -> Result<()> {
-    let runtime = Runtime::detect()?;
-    runtime.preflight()?;
-    let previous = runtime.image_id();
+    let backend = backend::detect()?;
+    backend.preflight()?;
+    let previous = backend.image_id(BASE)?;
     // Embed the build inputs so a cargo-installed binary needs no checkout nearby.
     let context = tempfile::tempdir()?;
     for (name, data) in [
@@ -61,55 +69,16 @@ pub fn build(no_cache: bool) -> Result<()> {
     ] {
         fs::write(context.path().join(name), data)?;
     }
-    let build_image = |image: &str, dockerfile: &str| -> Result<()> {
-        let file = context.path().join(dockerfile);
-        let file = file.to_string_lossy();
-        let dir = context.path().to_string_lossy();
-        let mut args = vec!["build"];
-        if no_cache {
-            args.push("--no-cache");
-        }
-        args.extend(["-t", image, "-f", &file, &dir]);
-        runtime.checked(&args)
-    };
-    build_image("nix-container-base-build:latest", "Dockerfile.base-build")?;
-    let out = tempfile::tempdir()?;
-    // SAFETY: getuid/getgid have no preconditions.
-    let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-    runtime.checked(&[
-        "run",
-        "--rm",
-        "-e",
-        &format!("HOST_UID={uid}"),
-        "-e",
-        &format!("HOST_GID={gid}"),
-        "-e",
-        if runtime.apple {
-            "IMAGE_FORMAT=oci"
-        } else {
-            "IMAGE_FORMAT=docker"
-        },
-        "-v",
-        &format!("{}:/tmp/out", out.path().display()),
-        "nix-container-base-build:latest",
-    ])?;
-    let suffix = if runtime.apple { "-oci.tar" } else { ".tar.gz" };
-    let mut artifacts = fs::read_dir(out.path())?.collect::<std::io::Result<Vec<_>>>()?;
-    artifacts.retain(|f| f.file_name().to_string_lossy().ends_with(suffix));
-    artifacts.sort_by_key(|f| f.metadata().and_then(|m| m.modified()).ok());
-    let artifact = artifacts.last().with_context(|| {
-        format!(
-            "no image artifact (*{suffix}) produced in {}",
-            out.path().display()
-        )
+    backend.build_images(&BuildSpec {
+        context: context.path().into(),
+        identity: Identity::host(),
+        no_cache,
     })?;
-    runtime.checked(&["image", "load", "-i", &artifact.path().to_string_lossy()])?;
-    build_image("nix-container:latest", "Dockerfile")?;
-    let new = runtime.image_id();
+    let new = backend.image_id(BASE)?;
     if new.is_some() && previous != new {
-        for volume in runtime.cache_volumes()? {
-            if !runtime.quiet(&["volume", "rm", &volume])? {
-                eprintln!("nix-container: could not remove {volume} (still in use? stop running containers and run 'nix-container clear-cache --all')");
+        for volume in cache_volumes(backend.as_ref())? {
+            if let Err(error) = backend.remove_volume(&volume) {
+                eprintln!("nix-container: {error:#} (still in use? stop running containers and run 'nix-container clear-cache --all')");
             }
         }
         println!("nix-container: {BASE} changed; invalidated unused cache volumes");
