@@ -5,8 +5,9 @@ Nix on the host.
 
 ## Goals
 
-- **No dependencies on the host.** The host only needs a container CLI (`docker` or
-  Apple's `container`). All Nix tooling lives inside the image.
+- **No host Nix installation.** Install the Rust `nix-container` binary and a
+  container CLI (`docker` or Apple's `container`). All Nix tooling lives inside
+  the image; Rust is only needed to compile the binary.
 - **Per-project shells.** Drop a `shell.nix` (or `default.nix`) into any
   directory and start a container that auto-launches `nix-shell` against it.
   Recurring options can live in a `nix-container.yml` next to it.
@@ -18,9 +19,10 @@ Nix on the host.
 ## Requirements
 
 - A container runtime in `PATH`: `docker` or Apple's `container`.
-- For the `container` backend: `jq` in `PATH` (ships with recent macOS), the
-  service running (`container system start`), and a guest kernel configured
-  (`container system kernel set --recommended`). See [Using Apple's
+- Linux or macOS. Building the CLI requires Rust 1.85+ and a system linker.
+- For the `container` backend: the service running (`container system start`)
+  and a guest kernel configured (`container system kernel set --recommended`).
+  JSON is parsed directly in Rust; `jq` is not required. See [Using Apple's
   `container`](#using-apples-container).
 - For `--with-gh-token`: the `gh` CLI, authenticated.
 - For `--with-aws`: the `aws` CLI (v2.13+ for `configure export-credentials`).
@@ -28,23 +30,40 @@ Nix on the host.
 
 ## Setup
 
-Source the script from your shell rc (works in `bash` and `zsh`):
+Install from this checkout (ensure `~/.cargo/bin` is in `PATH`):
 
 ```sh
-source /path/to/nix-container/nix-container.sh
+cargo install --path . --locked
 ```
 
-Build the images (first time, and after any change to `Dockerfile*`):
+No shell sourcing is required. Build the images on first use:
 
 ```sh
-nix-container-build
+nix-container build
 ```
 
-This produces three images:
+The Dockerfiles and container-side setup scripts are embedded in the binary,
+so the installed CLI works without this checkout. After changing those files,
+reinstall the binary before rebuilding the images. The build produces:
 
 - `nix-container-base-build:latest` — intermediate, used to produce the base tarball.
 - `nix-container-base:latest` — base image with Nix, direnv, nix-direnv.
 - `nix-container:latest` — the image used at runtime.
+
+### Migrating from the shell implementation
+
+Existing run flags, flat YAML configuration, environment variables and volume
+names are retained. The management commands are now `nix-container init`,
+`nix-container build` and `nix-container clear-cache`. To keep their old hyphenated
+names, optionally source `nix-container.sh` from bash/zsh; it now contains only
+three compatibility wrappers calling the installed binary. Restart your shell
+after upgrading to discard any previously sourced implementation.
+
+Two validation changes are intentional: extra mounts cannot overlap other mounts
+(including managed paths), and container paths containing `.`/`..` or repeated
+slashes are rejected. An explicit empty config list suppresses environment
+fallbacks. Projects reached through symlinks use their physical directory name
+for the container name and working directory.
 
 ## Getting started
 
@@ -52,7 +71,7 @@ To scaffold a bare-bones `shell.nix` (no packages, empty shell hook) in the
 current directory:
 
 ```sh
-nix-container-init
+nix-container init
 ```
 
 Edit the generated `shell.nix` to add packages, then run `nix-container`. To
@@ -162,9 +181,9 @@ See [Networks](#networks) for what `network` and `network-aliases` do.
 may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
 accept `true`/`false`, `yes`/`no` and `on`/`off`. List options such as ports,
 mounts and persistence may also be written inline (`ports: [8080, 3000:3000]`)
-or as a single value (`ports: 8080`). The file is parsed by the script itself,
-so no YAML tooling is needed on the host — which also means only this flat
-subset of YAML is understood. Quoted scalars must have a matching delimiter;
+or as a single value (`ports: 8080`). The file is parsed directly in Rust,
+so no YAML tooling is needed on the host. Only this flat subset of YAML is
+understood; flow-list items cannot contain commas. Quoted scalars must have a matching delimiter;
 embedded quote escapes are not
 supported. Unknown keys and malformed values are reported with a line number
 and abort the run.
@@ -224,9 +243,9 @@ nix-container --mount ../shared-lib --mount ~/.gitconfig:/home/nix/.gitconfig:ro
 A few things are rejected up front rather than at container startup: a host
 path that doesn't exist (docker would otherwise create it as a new root-owned
 directory that looks like an empty mount), two mounts landing on the same
-container path, and container paths that nix-container manages itself (`/nix`,
-`/home/nix/.cache`, `/home/nix/.nix-container-persist` and the project
-directory). Host paths containing a `:`
+container path, and container paths overlapping another mount or a path that nix-container
+manages itself (`/nix`, `/home/nix/.cache`, `/home/nix/.nix-container-persist`
+and the project directory). Host paths containing a `:`
 aren't supported, the same limitation `docker run -v` has.
 
 Writes through a read-write mount are real writes to the host directory, and
@@ -257,7 +276,7 @@ The volume name (`nix-container-persist-<project-hash>-<location-hash>`) is
 derived from the physical project directory and normalized container path. As
 a result, each project and location has separate state, and the volume remains
 attached across subsequent `nix-container` runs, edits to
-`shell.nix`, image rebuilds, and `nix-container-clear-cache`. Moving the project
+`shell.nix`, image rebuilds, and `nix-container clear-cache`. Moving the project
 to a different host path intentionally gives it a fresh set of volumes.
 Fresh volumes are initialized with any directory contents baked into the image
 and made writable by the container's `nix` user.
@@ -290,7 +309,7 @@ project directory itself is already persistent on the host; use
 [`--mount`](#mounting-extra-directories) instead when data should
 be directly accessible as host files rather than managed by the container
 runtime. Persistence volumes are deliberately not removed by
-`nix-container-clear-cache`, because they may contain user data.
+`nix-container clear-cache`, because they may contain user data.
 
 ### Sharing Nix expressions across projects
 
@@ -376,7 +395,7 @@ nix-container --network dev-network
 The value is a single network name or mode passed to the container CLI's
 `--network` option. On first use, a missing named network is created with the
 runtime's default network settings; it is reused on subsequent runs and is not
-removed with the container or by `nix-container-clear-cache`. Runtime modes
+removed with the container or by `nix-container clear-cache`. Runtime modes
 such as `host`, `none`, `bridge` and `default` are not created. If omitted, the
 runtime's default network is used. Available modes depend on the runtime.
 
@@ -461,13 +480,13 @@ container system start                             # start the service
 container system kernel set --recommended          # install a guest kernel
 ```
 
-`nix-container` and `nix-container-build` preflight both of these (and the
-presence of `jq`) and print the exact command to run if something is missing.
+`nix-container` and `nix-container build` preflight both of these and print
+the exact command to run if something is missing.
 
 What nix-container does for you:
 
 - **Image format.** `container` only loads OCI archives, while Nix's `docker.nix`
-  produces a docker-archive. `nix-container-build` converts the base image with
+  produces a docker-archive. `nix-container build` converts the base image with
   `skopeo` (pulled in via Nix during the build) when building for `container`.
 - **Store seeding.** Docker populates a fresh named volume from the image's
   contents on first mount; `container` mounts an empty filesystem instead. Since
@@ -480,13 +499,13 @@ From a directory with a `shell.nix` or `default.nix`, clear only that
 project's caches:
 
 ```sh
-nix-container-clear-cache
+nix-container clear-cache
 ```
 
 Clear caches for *every* nix-container project:
 
 ```sh
-nix-container-clear-cache --all
+nix-container clear-cache --all
 ```
 
 ## How caching works
@@ -548,3 +567,23 @@ nix-container --with-env .env
 
 The first time a secret reference is resolved, `op` may prompt you to unlock
 (e.g. via biometrics), then reuses the session for the rest of the run.
+
+## Development
+
+```sh
+cargo test --locked
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+```
+
+`nix-shell` provides the Rust toolchain, linker and ShellCheck if Nix is available.
+Tests use mock runtimes and credential helpers; they do not need Docker, Apple's
+`container`, Nix, or real credentials. CI runs them on Linux and macOS. Real
+image builds and interactive runtime behavior still require testing with an
+installed container runtime.
+
+The host implementation lives in `src/`: CLI/config parsing in `options.rs`,
+path and volume naming in `paths.rs`, runtime integration in `runtime.rs`, run
+planning in `run.rs`, and init/build/cache commands in `manage.rs`. Only the
+small container-side build and startup scripts remain shell, because they run
+inside the Nix image. `nix-container.sh` is optional compatibility glue.

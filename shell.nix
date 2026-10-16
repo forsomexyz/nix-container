@@ -1,5 +1,5 @@
 let pkgs = import <nixpkgs> {};
 in
-pkgs.mkShellNoCC {
-  packages = with pkgs; [ shellcheck ];
+pkgs.mkShell {
+  packages = with pkgs; [ cargo rustc rustfmt clippy shellcheck ];
 }

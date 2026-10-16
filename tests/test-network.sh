@@ -39,8 +39,9 @@ export PATH="$tmp/bin:$PATH" NIX_CONTAINER_CLI=mock-container MOCK_LOG="$tmp/arg
 export MOCK_NETWORKS="$tmp/networks" MOCK_EVENTS="$tmp/events"
 cd "$tmp/project"
 printf '{}\n' > shell.nix
-# shellcheck source=../nix-container.sh
-source "$repo_dir/nix-container.sh"
+# Test the compiled Rust CLI, not a shell implementation.
+NIX_CONTAINER_BIN=${NIX_CONTAINER_BIN:-$repo_dir/target/debug/nix-container}
+nix-container() { "$NIX_CONTAINER_BIN" "$@"; }
 
 assert_network() {
     local expected="$1" count
@@ -83,7 +84,10 @@ assert_rejected() {
 nix-container run true
 assert_network ''
 assert_aliases ''
-! grep -q 'inspect\|create' "$MOCK_EVENTS"
+if grep -q 'inspect\|create' "$MOCK_EVENTS"; then
+    echo 'default network unexpectedly inspected or created' >&2
+    exit 1
+fi
 printf 'network: dev-network # comment\n' > nix-container.yaml
 : > "$MOCK_EVENTS"
 nix-container run true
@@ -102,7 +106,10 @@ nix-container --network bridge run true
 assert_network bridge
 nix-container --network default run true
 assert_network default
-! grep -q 'inspect\|create' "$MOCK_EVENTS"
+if grep -q 'inspect\|create' "$MOCK_EVENTS"; then
+    echo 'runtime network mode unexpectedly inspected or created' >&2
+    exit 1
+fi
 nix-container --no-config run true
 assert_network ''
 printf 'network: "quoted network"\n' > nix-container.yml

@@ -1,5 +1,6 @@
 #!/bin/bash
-#
+# Runs only inside the base-build container; embedded by the Rust CLI.
+set -euo pipefail
 SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 
 : "${HOST_UID:?HOST_UID must be set (pass via docker run -e HOST_UID=\$(id -u))}"

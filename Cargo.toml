@@ -1,0 +1,18 @@
+[package]
+name = "nix-container"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Per-project Nix development shells inside Docker or Apple's container runtime"
+
+[dependencies]
+anyhow = "1"
+libc = "0.2"
+serde_json = "1"
+sha2 = "0.10"
+signal-hook = "0.3"
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
