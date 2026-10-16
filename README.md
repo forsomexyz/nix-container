@@ -111,6 +111,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `--with-env <file>`        | Load environment variables from a dotenv-style file. If the file has 1Password references (`op://...`), they are resolved at run time via `op run`; otherwise the file is passed to the CLI's `--env-file`. See [Environment files & secrets](#environment-files--secrets). |
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
+| `--network <name>`        | Connect to a named container network (or a runtime-supported mode such as `host` or `none`). Defaults to the runtime's network when unset. |
 | `--config <file>`          | Read options from `<file>` instead of `./nix-container.yml`. See [Configuration file](#configuration-file). |
 | `--no-config`              | Ignore `./nix-container.yml` and use only the options given on the command line. |
 
@@ -128,6 +129,7 @@ with-aws: dev            # true for the default profile, or a profile name
 with-env: .env           # relative to this file
 with-shared-nix-exprs: common=~/nix-common
 memory: 4G
+network: dev-network    # an existing network (or a runtime-supported mode)
 ports:
   - 8080
   - 3000:3000
@@ -143,10 +145,18 @@ With that file in place, a bare `nix-container` behaves like:
 
 ```sh
 nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
-  --with-shared-nix-exprs common=~/nix-common --memory 4G -p 8080 -p 3000:3000 \
+  --with-shared-nix-exprs common=~/nix-common --memory 4G --network dev-network \
+  -p 8080 -p 3000:3000 \
   --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib \
   --persist .local/share/my-tool --persist /var/lib/postgres
 ```
+
+`network` is a single network name or mode passed to the container CLI's
+`--network` option. On first use, a missing named network is created with the
+runtime's default network settings; it is reused on subsequent runs and is not
+removed with the container or by `nix-container-clear-cache`. Runtime modes
+such as `host`, `none`, `bridge`, and `default` are not created. If omitted, the
+runtime's default network is used. Available modes depend on the runtime.
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
 may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
@@ -161,7 +171,7 @@ and abort the run.
 
 Precedence, highest first:
 
-1. Command line flags.
+1. Command line flags (including `--network`, which overrides `network` in the file).
 2. `nix-container.yml` (or the file given to `--config`).
 3. Environment variables (`NIX_CONTAINER_MEMORY`, `NIX_CONTAINER_SHARED_NIX_EXPRS`).
 

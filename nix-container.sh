@@ -536,6 +536,13 @@ _nix_container_parse_config() {
                 fi
                 printf 'memory=%s\n' "$value"
                 ;;
+            network)
+                if [ -z "$value" ]; then
+                    echo "nix-container: $file:$lineno: 'network' expects a network name" >&2
+                    return 1
+                fi
+                printf 'network=%s\n' "$value"
+                ;;
             port|ports)
                 # Either an inline `[a, b]` flow sequence, a single scalar, or a
                 # `- spec` block on the lines that follow.
@@ -730,6 +737,25 @@ _nix_container_prepare_volumes() {
         -v "$cache_vol:/seed-cache" \
         nix-container:latest \
         -c "[ -e /seed-nix/store ] || cp -a /nix/. /seed-nix/; chown $owner /seed-cache"
+}
+
+# Ensure a named network exists before the project's run. Runtime network modes
+# are not creatable networks; leave their interpretation to the CLI. Networks
+# are shared resources and intentionally survive container runs and cache clears.
+_nix_container_prepare_network() {
+    local cli="$1" network="$2"
+    case "$network" in
+        ''|bridge|host|none|default|container:*|ns:*) return 0 ;;
+    esac
+    if ! "$cli" network inspect "$network" >/dev/null 2>&1; then
+        # Another process may create it between inspect and create. Only accept
+        # a failed create if it can be inspected now; otherwise surface the error.
+        if ! "$cli" network create "$network" >/dev/null && \
+                ! "$cli" network inspect "$network" >/dev/null 2>&1; then
+            echo "nix-container: could not create network: $network" >&2
+            return 1
+        fi
+    fi
 }
 
 # Create and initialize one user-requested persistence volume. Mounting it at a
@@ -1002,6 +1028,7 @@ nix-container() (
     local env_file=""
     local aws_profile=""
     local memory=""
+    local network=""
     local cli_aws=0
     local cli_ports=0
     local cli_mounts=0
@@ -1069,6 +1096,9 @@ Options:
                         container CLI's --memory. SIZE is a number with an
                         optional K, M, G, T or P suffix (e.g. 512M, 4G).
                         Defaults to nix-container.yml, then $NIX_CONTAINER_MEMORY.
+  --network NAME        Connect the container to NAME (e.g. a custom network,
+                        host, or none). Defaults to the network in nix-container.yml,
+                        then the container CLI's default network.
   --config FILE         Read options from FILE instead of ./nix-container.yml.
   --no-config           Ignore ./nix-container.yml.
   -h, --help            Show this help message.
@@ -1192,6 +1222,22 @@ EOF
                 memory="${1#*=}"
                 shift
                 ;;
+            --network)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires a network name" >&2
+                    return 1
+                fi
+                network="$2"
+                shift 2
+                ;;
+            --network=*)
+                network="${1#--network=}"
+                if [ -z "$network" ]; then
+                    echo "nix-container: --network requires a network name" >&2
+                    return 1
+                fi
+                shift
+                ;;
             --config)
                 if [ -z "${2:-}" ]; then
                     echo "nix-container: $1 requires a file argument" >&2
@@ -1266,6 +1312,7 @@ EOF
                 with-aws) [ "$cli_aws" -eq 1 ] || with_aws="$cfg_value" ;;
                 aws-profile) [ "$cli_aws" -eq 1 ] || aws_profile="$cfg_value" ;;
                 memory) [ -n "$memory" ] || memory="$cfg_value" ;;
+                network) [ -n "$network" ] || network="$cfg_value" ;;
                 port)
                     if [ "$cli_ports" -ne 1 ]; then
                         normalized_port=$(_nix_container_force_loopback "$cfg_value") || return 1
@@ -1610,6 +1657,13 @@ EOF
         memory_args+=(--memory "$memory")
     fi
 
+    # Leave the runtime's default network unchanged unless one is requested.
+    # The CLI handles named networks and backend-specific modes such as host/none.
+    local -a network_args=()
+    if [ -n "$network" ]; then
+        network_args=(--network "$network")
+    fi
+
     # Apple's `container` needs extra run flags that docker doesn't:
     #   --user  the image's `USER nix` (a name) fails to start on `container`;
     #           a numeric uid:gid works, and since the base is built with the
@@ -1691,6 +1745,7 @@ EOF
         "${mount_args[@]}"
         "${port_args[@]}"
         "${memory_args[@]}"
+        "${network_args[@]}"
         -v "nix-container-store-$hash:/nix"
         -v "nix-container-cache-$hash:/home/nix/.cache"
         -v "$PWD:/home/nix/$dir"
@@ -1715,6 +1770,8 @@ EOF
         [ -t 0 ] && it_args+=(-i)
         [ -t 1 ] && it_args+=(-t)
     fi
+
+    _nix_container_prepare_network "$cli" "$network" || return 1
 
     local start=$SECONDS
     "${op_prefix[@]}" "$cli" run "${it_args[@]}" "${run_args[@]}"
