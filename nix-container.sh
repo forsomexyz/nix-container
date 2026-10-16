@@ -316,6 +316,18 @@ _nix_container_valid_env_name() {
     esac
 }
 
+# Return success for a network alias shaped like a DNS name the runtime can
+# register: letters, digits, '.', '_' and '-', starting and ending with a
+# letter or digit. The value is passed to the CLI unchanged, so only the shape
+# is checked here to catch typos before a container is started.
+_nix_container_valid_network_alias() {
+    case "$1" in
+        ''|*[!A-Za-z0-9._-]*) return 1 ;;
+        [!A-Za-z0-9]*|*[!A-Za-z0-9]) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
 # Trim leading and trailing whitespace from a string.
 _nix_container_trim() {
     local s="$1"
@@ -543,6 +555,22 @@ _nix_container_parse_config() {
                 fi
                 printf 'network=%s\n' "$value"
                 ;;
+            network-alias|network-aliases)
+                # Extra DNS names for the container on its network; same
+                # scalar, block-list and flow-list shapes as ports.
+                list_key="$key"
+                list_out=network-alias
+                case "$value" in
+                    '') ;;
+                    '['*']')
+                        items=$(_nix_container_yaml_flow_items "$value" "$file" "$lineno" "$key") || return 1
+                        while IFS= read -r item; do
+                            [ -n "$item" ] && printf 'network-alias=%s\n' "$item"
+                        done <<< "$items"
+                        ;;
+                    *) printf 'network-alias=%s\n' "$value" ;;
+                esac
+                ;;
             port|ports)
                 # Either an inline `[a, b]` flow sequence, a single scalar, or a
                 # `- spec` block on the lines that follow.
@@ -739,14 +767,24 @@ _nix_container_prepare_volumes() {
         -c "[ -e /seed-nix/store ] || cp -a /nix/. /seed-nix/; chown $owner /seed-cache"
 }
 
+# Return success when a --network value selects one of the runtime's own
+# network modes rather than naming a network that can be created and attached
+# to. Those are left to the CLI to interpret, and they carry no DNS names of
+# their own, so they take no aliases either.
+_nix_container_network_is_mode() {
+    case "$1" in
+        bridge|host|none|default|container:*|ns:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Ensure a named network exists before the project's run. Runtime network modes
 # are not creatable networks; leave their interpretation to the CLI. Networks
 # are shared resources and intentionally survive container runs and cache clears.
 _nix_container_prepare_network() {
     local cli="$1" network="$2"
-    case "$network" in
-        ''|bridge|host|none|default|container:*|ns:*) return 0 ;;
-    esac
+    [ -n "$network" ] || return 0
+    ! _nix_container_network_is_mode "$network" || return 0
     if ! "$cli" network inspect "$network" >/dev/null 2>&1; then
         # Another process may create it between inspect and create. Only accept
         # a failed create if it can be inspected now; otherwise surface the error.
@@ -1031,10 +1069,12 @@ nix-container() (
     local network=""
     local cli_aws=0
     local cli_ports=0
+    local cli_network_aliases=0
     local cli_mounts=0
     local cli_persistence=0
     local cli_shared_exprs=0
     local -a shared_expr_specs=()
+    local -a network_aliases=()
     local -a mount_specs=()
     local -a persistence_specs=()
     local config_file=""
@@ -1099,6 +1139,11 @@ Options:
   --network NAME        Connect the container to NAME (e.g. a custom network,
                         host, or none). Defaults to the network in nix-container.yml,
                         then the container CLI's default network.
+  --network-alias NAME  Additional DNS name the container answers to on its
+                        network, so other containers can reach it as NAME.
+                        Requires --network to name a network (not a mode such
+                        as host or none). Repeatable. Overrides the aliases set
+                        in nix-container.yml.
   --config FILE         Read options from FILE instead of ./nix-container.yml.
   --no-config           Ignore ./nix-container.yml.
   -h, --help            Show this help message.
@@ -1238,6 +1283,24 @@ EOF
                 fi
                 shift
                 ;;
+            --network-alias)
+                if [ -z "${2:-}" ]; then
+                    echo "nix-container: $1 requires an alias (e.g. api)" >&2
+                    return 1
+                fi
+                cli_network_aliases=1
+                network_aliases+=("$2")
+                shift 2
+                ;;
+            --network-alias=*)
+                if [ -z "${1#--network-alias=}" ]; then
+                    echo "nix-container: --network-alias requires an alias (e.g. api)" >&2
+                    return 1
+                fi
+                cli_network_aliases=1
+                network_aliases+=("${1#--network-alias=}")
+                shift
+                ;;
             --config)
                 if [ -z "${2:-}" ]; then
                     echo "nix-container: $1 requires a file argument" >&2
@@ -1313,6 +1376,9 @@ EOF
                 aws-profile) [ "$cli_aws" -eq 1 ] || aws_profile="$cfg_value" ;;
                 memory) [ -n "$memory" ] || memory="$cfg_value" ;;
                 network) [ -n "$network" ] || network="$cfg_value" ;;
+                network-alias)
+                    [ "$cli_network_aliases" -eq 1 ] || network_aliases+=("$cfg_value")
+                    ;;
                 port)
                     if [ "$cli_ports" -ne 1 ]; then
                         normalized_port=$(_nix_container_force_loopback "$cfg_value") || return 1
@@ -1662,6 +1728,36 @@ EOF
     local -a network_args=()
     if [ -n "$network" ]; then
         network_args=(--network "$network")
+    fi
+
+    # Aliases are names the network's own resolver hands out, so they need a
+    # network that nix-container attached the container to. Reject the modes
+    # (and the unset default) here rather than letting the run fail later with
+    # a backend-specific message.
+    if [ "${#network_aliases[@]}" -gt 0 ]; then
+        if [ -z "$network" ]; then
+            echo "nix-container: --network-alias requires --network (aliases are only resolvable on a named network)" >&2
+            return 1
+        fi
+        if _nix_container_network_is_mode "$network"; then
+            echo "nix-container: --network-alias: $network is a network mode, not a named network that can carry aliases" >&2
+            return 1
+        fi
+        local alias_name seen_aliases=":"
+        for alias_name in "${network_aliases[@]}"; do
+            if ! _nix_container_valid_network_alias "$alias_name"; then
+                echo "nix-container: --network-alias: invalid alias: $alias_name (use letters, digits, '.', '_' or '-', starting and ending with a letter or digit)" >&2
+                return 1
+            fi
+            case "$seen_aliases" in
+                *":$alias_name:"*)
+                    echo "nix-container: --network-alias: duplicate alias: $alias_name" >&2
+                    return 1
+                    ;;
+            esac
+            seen_aliases="$seen_aliases$alias_name:"
+            network_args+=(--network-alias "$alias_name")
+        done
     fi
 
     # Apple's `container` needs extra run flags that docker doesn't:

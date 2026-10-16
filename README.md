@@ -112,6 +112,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 | `-p`, `--port <spec>`      | Publish a container port. Same syntax as `docker run -p` (e.g. `8080`, `8080:8080`). Repeatable. The host side is always rewritten to `127.0.0.1` so published ports are only reachable from the local machine. |
 | `-m`, `--memory <size>`    | Amount of memory the container may use. See [Memory](#memory). |
 | `--network <name>`        | Connect to a named container network (or a runtime-supported mode such as `host` or `none`). Defaults to the runtime's network when unset. |
+| `--network-alias <name>`  | Extra DNS name the container answers to on its network. Repeatable. Requires `--network` to name a network. See [Networks](#networks). |
 | `--config <file>`          | Read options from `<file>` instead of `./nix-container.yml`. See [Configuration file](#configuration-file). |
 | `--no-config`              | Ignore `./nix-container.yml` and use only the options given on the command line. |
 
@@ -130,6 +131,9 @@ with-env: .env           # relative to this file
 with-shared-nix-exprs: common=~/nix-common
 memory: 4G
 network: dev-network    # an existing network (or a runtime-supported mode)
+network-aliases:
+  - api
+  - api.internal
 ports:
   - 8080
   - 3000:3000
@@ -146,17 +150,13 @@ With that file in place, a bare `nix-container` behaves like:
 ```sh
 nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
   --with-shared-nix-exprs common=~/nix-common --memory 4G --network dev-network \
+  --network-alias api --network-alias api.internal \
   -p 8080 -p 3000:3000 \
   --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib \
   --persist .local/share/my-tool --persist /var/lib/postgres
 ```
 
-`network` is a single network name or mode passed to the container CLI's
-`--network` option. On first use, a missing named network is created with the
-runtime's default network settings; it is reused on subsequent runs and is not
-removed with the container or by `nix-container-clear-cache`. Runtime modes
-such as `host`, `none`, `bridge`, and `default` are not created. If omitted, the
-runtime's default network is used. Available modes depend on the runtime.
+See [Networks](#networks) for what `network` and `network-aliases` do.
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
 may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
@@ -177,9 +177,9 @@ Precedence, highest first:
 
 A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
 set in the file, and passing any `-p` (or `--mount`, `--persist`,
-`--with-shared-nix-exprs`) replaces *all* ports (or mounts, persistence
-locations, or shared expression dirs) from the file rather than adding to
-them. To ignore the file for a single run:
+`--network-alias`, `--with-shared-nix-exprs`) replaces *all* ports (or mounts,
+persistence locations, network aliases, or shared expression dirs) from the
+file rather than adding to them. To ignore the file for a single run:
 
 ```sh
 nix-container --no-config
@@ -363,6 +363,51 @@ Two things to keep in mind:
   and either check it out at a fixed revision on each machine, or skip
   `--with-shared-nix-exprs` and `import (builtins.fetchGit { url = ...; rev = ...; })`
   directly in `shell.nix`.
+
+### Networks
+
+By default the container joins whatever network the runtime hands out. To put
+it on a specific one:
+
+```sh
+nix-container --network dev-network
+```
+
+The value is a single network name or mode passed to the container CLI's
+`--network` option. On first use, a missing named network is created with the
+runtime's default network settings; it is reused on subsequent runs and is not
+removed with the container or by `nix-container-clear-cache`. Runtime modes
+such as `host`, `none`, `bridge` and `default` are not created. If omitted, the
+runtime's default network is used. Available modes depend on the runtime.
+
+On a named network, containers reach each other by name — a nix-container run
+is named after its project directory. `--network-alias` adds further names the
+container answers to on that network:
+
+```sh
+nix-container --network dev-network --network-alias api --network-alias api.internal
+```
+
+which lets another container on `dev-network` reach this one at `api` or
+`api.internal` regardless of what the project directory is called. Aliases are
+only meaningful on a network nix-container attached the container to, so they
+require `--network` with a name: combining them with no network at all, or with
+a mode such as `host` or `none`, is rejected before anything starts. Whether a
+runtime honors aliases is up to the runtime — docker resolves them on
+user-defined networks.
+
+To set defaults for a single project, put them in its
+[`nix-container.yml`](#configuration-file):
+
+```yaml
+network: dev-network
+network-aliases:
+  - api
+  - api.internal
+```
+
+The flags take precedence over `nix-container.yml`, and passing any
+`--network-alias` replaces every alias from the file rather than adding to them.
 
 ### Memory
 
