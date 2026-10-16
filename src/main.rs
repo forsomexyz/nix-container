@@ -28,7 +28,6 @@ Options (CLI > nix-container.yml/.yaml > environment):
   -p, --port SPEC                  Publish a port on 127.0.0.1 only (repeatable)
   -m, --memory SIZE                Runtime memory limit (e.g. 512M, 4G)
   --network NAME                   Join a named network or runtime network mode
-  --network-alias NAME             DNS alias; requires a named network (repeatable)
   --config FILE                    Use this config instead of the discovered file
   --no-config                      Ignore the project config
   -h, --help                       Show help

@@ -57,16 +57,6 @@ assert_network() {
     fi
 }
 
-# Aliases follow --network in argv, in the order they were given.
-assert_aliases() {
-    local expected="$1" got
-    got=$(awk 'previous == "--network-alias" { print } { previous = $0 }' "$MOCK_LOG")
-    [ "$got" = "$expected" ] || {
-        echo "expected aliases [$expected], got [$got]" >&2
-        exit 1
-    }
-}
-
 assert_rejected() {
     local message="$1"
     shift
@@ -83,7 +73,6 @@ assert_rejected() {
 
 nix-container run true
 assert_network ''
-assert_aliases ''
 if grep -q 'inspect\|create' "$MOCK_EVENTS"; then
     echo 'default network unexpectedly inspected or created' >&2
     exit 1
@@ -148,53 +137,14 @@ if nix-container --network= run true > "$tmp/out" 2>&1; then
 fi
 grep -q 'requires a network name' "$tmp/out"
 
-# Aliases: both spellings, in order, after the network they belong to.
-nix-container --no-config --network dev-network --network-alias api --network-alias=api.internal run true
-assert_network dev-network
-assert_aliases $'api\napi.internal'
-nix-container --no-config --network dev-network run true
-assert_aliases ''
-
-# ... from the config file, in every list shape the parser accepts.
-printf 'network: dev-network\nnetwork-aliases:\n  - api\n  - api.internal\n' > "$tmp/custom.yaml"
-nix-container --config "$tmp/custom.yaml" run true
-assert_network dev-network
-assert_aliases $'api\napi.internal'
-printf 'network: dev-network\nnetwork-aliases: [api, api.internal]\n' > "$tmp/custom.yaml"
-nix-container --config "$tmp/custom.yaml" run true
-assert_aliases $'api\napi.internal'
-printf 'network: dev-network\nnetwork_alias: api # underscores and a comment\n' > "$tmp/custom.yaml"
-nix-container --config "$tmp/custom.yaml" run true
-assert_aliases api
-
-# A flag replaces every alias from the file rather than adding to them.
-printf 'network: dev-network\nnetwork-aliases: [api, api.internal]\n' > "$tmp/custom.yaml"
-nix-container --config "$tmp/custom.yaml" --network-alias only run true
-assert_aliases only
-# ... and the flag network still carries the file's aliases.
-nix-container --config "$tmp/custom.yaml" --network other run true
-assert_network other
-assert_aliases $'api\napi.internal'
-
-# Aliases need a network to be resolvable on.
-assert_rejected 'requires --network' --no-config --network-alias api
-for mode in host none bridge default container:other ns:/var/run/netns/x; do
-    assert_rejected 'is a network mode' --no-config --network "$mode" --network-alias api
-done
-
-# Malformed aliases are rejected before the network is created or a container runs.
+# Network aliases were removed: Apple's container CLI has no --network-alias,
+# so neither the flag nor the config keys are accepted any more.
 : > "$MOCK_EVENTS"
-for bad in -api api- .api api. 'api name' 'api/sub' 'api:1'; do
-    assert_rejected 'invalid alias' --no-config --network alias-check --network-alias "$bad"
-done
-assert_rejected 'duplicate alias' --no-config --network alias-check --network-alias api --network-alias api
-[ ! -s "$MOCK_EVENTS" ] || { echo 'invalid aliases reached the runtime' >&2; exit 1; }
-if nix-container --no-config --network dev-network --network-alias= run true > "$tmp/out" 2>&1; then
-    echo 'accepted empty --network-alias' >&2
-    exit 1
-fi
-grep -q 'requires an alias' "$tmp/out"
-printf 'network: dev-network\nnetwork-aliases:\n  -\n' > "$tmp/custom.yaml"
-assert_rejected 'custom.yaml:3:' --config "$tmp/custom.yaml"
+assert_rejected 'unknown option: --network-alias' --no-config --network dev-network --network-alias api
+printf 'network: dev-network\nnetwork-aliases: [api]\n' > "$tmp/custom.yaml"
+assert_rejected 'unknown option: network-aliases' --config "$tmp/custom.yaml"
+printf 'network: dev-network\nnetwork_alias: api\n' > "$tmp/custom.yaml"
+assert_rejected 'unknown option: network-alias' --config "$tmp/custom.yaml"
+[ ! -s "$MOCK_EVENTS" ] || { echo 'rejected aliases reached the runtime' >&2; exit 1; }
 
 echo 'network tests passed'

@@ -165,24 +165,6 @@ impl Plan {
         if !network.is_empty() {
             pair(&mut args, "--network", network);
         }
-        if !options.list("network-aliases").is_empty() {
-            if network.is_empty() {
-                bail!("--network-alias requires --network");
-            }
-            if paths::network_mode(network) {
-                bail!("--network-alias: {network} is a network mode, not a named network that can carry aliases");
-            }
-            let mut seen = HashSet::new();
-            for alias in options.list("network-aliases") {
-                if !paths::valid_alias(alias) {
-                    bail!("--network-alias: invalid alias: {alias}");
-                }
-                if !seen.insert(alias) {
-                    bail!("--network-alias: duplicate alias: {alias}");
-                }
-                pair(&mut args, "--network-alias", alias);
-            }
-        }
         for port in options.list("ports") {
             pair(&mut args, "-p", paths::loopback(port)?);
         }

@@ -167,11 +167,6 @@ pub fn valid_name(name: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
-pub fn valid_alias(name: &str) -> bool {
-    valid_name(name)
-        && name.as_bytes()[0].is_ascii_alphanumeric()
-        && name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
-}
 pub fn valid_env(name: &str) -> bool {
     !name.is_empty()
         && !name.as_bytes()[0].is_ascii_digit()

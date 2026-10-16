@@ -94,7 +94,6 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
             "-p" | "--port" => ("ports", true, "a port specification"),
             "-m" | "--memory" => ("memory", false, "a memory size"),
             "--network" => ("network", false, "a network name"),
-            "--network-alias" => ("network-aliases", true, "an alias"),
             "--config" => ("config", false, "a file argument"),
             _ => bail!("unknown option: {arg}"),
         };
@@ -170,7 +169,6 @@ fn list_key(key: &str) -> Option<&str> {
         "port" | "ports" => Some("ports"),
         "mount" | "mounts" => Some("mounts"),
         "persist" | "persistence" => Some("persistence"),
-        "network-alias" | "network-aliases" => Some("network-aliases"),
         "with-shared-nix-exprs" => Some("with-shared-nix-exprs"),
         _ => None,
     }
@@ -325,9 +323,10 @@ mod tests {
     }
     #[test]
     fn config_shapes_and_paths() {
-        let o = config("with_gh_token: yes\nwith-aws: dev\nports: [8080, '3000:3000']\nmounts:\n - ../data:ro\nnetwork-alias: api # hi\nwith-env: .env\npersist: .local/share/app", Path::new("/cfg/options.yml")).unwrap();
+        let o = config("with_gh_token: yes\nwith-aws: dev\nports: [8080, '3000:3000']\nmounts:\n - ../data:ro\nnetwork: dev-network # hi\nwith-env: .env\npersist: .local/share/app", Path::new("/cfg/options.yml")).unwrap();
         assert!(o.enabled("with-gh-token"));
         assert_eq!(o.list("ports"), ["8080", "3000:3000"]);
+        assert_eq!(o.get("network"), Some("dev-network")); // trailing comment stripped
         assert_eq!(o.get("mounts"), Some("/cfg/../data:ro"));
         assert_eq!(o.get("with-env"), Some("/cfg/.env"));
         assert_eq!(o.get("persistence"), Some(".local/share/app"));
@@ -347,24 +346,14 @@ mod tests {
     }
     #[test]
     fn command_boundary_and_override() {
-        let args = [
-            "--network=dev",
-            "--network-alias",
-            "api",
-            "run",
-            "echo",
-            "--help",
-        ]
-        .map(String::from);
+        let args = ["--network=dev", "-p", "8080", "run", "echo", "--help"].map(String::from);
         let i = parse(&args).unwrap();
         assert!(!i.help);
         assert_eq!(i.command.unwrap(), ["echo", "--help"]);
-        let mut o = config(
-            "network: old\nnetwork-aliases: [old, older]",
-            Path::new("x"),
-        )
-        .unwrap();
+        let mut o = config("network: old\nports: [1111, 2222]", Path::new("x")).unwrap();
         o.overlay(i.options);
-        assert_eq!(o.list("network-aliases"), ["api"]);
+        // A flag replaces the config's whole list rather than appending to it.
+        assert_eq!(o.list("ports"), ["8080"]);
+        assert_eq!(o.get("network"), Some("dev"));
     }
 }
