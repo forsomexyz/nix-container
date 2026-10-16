@@ -88,8 +88,11 @@ nix-container
 
 The current directory is bind-mounted to `/home/nix/<dirname>` and set as the
 working directory inside the container. The entrypoint is `nix-shell`, so the
-container drops you into the project's resolved environment. Other host
-directories can be added with [`--mount`](#mounting-extra-directories).
+container drops you into the project's resolved environment. On a terminal,
+`nix-container` shows a short, five-line animated splash during startup, clearing
+it before the shell takes over. Small terminals, redirected output, and
+`nix-container run ...` stay quiet.
+Other host directories can be added with [`--mount`](#mounting-extra-directories).
 
 ### Running a command and exiting
 

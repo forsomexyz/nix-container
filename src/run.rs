@@ -6,16 +6,115 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     collections::{BTreeMap, HashSet},
-    env, fs,
-    io::{self, IsTerminal},
+    env,
+    fmt::Write as _,
+    fs,
+    io::{self, IsTerminal, Write},
+    os::fd::AsRawFd,
     path::PathBuf,
     process::Stdio,
+    sync::mpsc::{self, RecvTimeoutError, Sender},
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 
 fn pair(args: &mut Vec<String>, flag: &str, value: impl Into<String>) {
     args.push(flag.into());
     args.push(value.into());
+}
+
+const ANIMATION_HEIGHT: usize = 5;
+const TRAIL_WIDTH: usize = 24;
+
+fn animation_frame(frame: usize) -> String {
+    let mut screen = String::from("\r\x1b[2K  \x1b[1;38;5;213m✦\x1b[0m  N I X   C O N T A I N E R");
+    for row in 0..3 {
+        screen.push_str("\x1b[1B\r\x1b[2K  ");
+        let head = (frame + row * 7) % TRAIL_WIDTH;
+        for column in 0..TRAIL_WIDTH {
+            let distance = (head + TRAIL_WIDTH - column) % TRAIL_WIDTH;
+            let (glyph, color) = match distance {
+                0 => ("◆", 213),
+                1 => ("▓", 177),
+                2 => ("▒", 141),
+                3 => ("░", 105),
+                _ => ("·", 60),
+            };
+            let _ = write!(screen, "\x1b[38;5;{color}m{glyph}");
+        }
+        screen.push_str("\x1b[0m");
+    }
+    screen.push_str("\x1b[1B\r\x1b[2K  starting nix container ...");
+    let _ = write!(screen, "\x1b[{}A\r", ANIMATION_HEIGHT - 1);
+    screen
+}
+
+// Only draw on a large enough terminal; never put cursor controls in captured output.
+struct Spinner(Option<(Sender<()>, JoinHandle<()>)>);
+
+impl Spinner {
+    fn start(interactive: bool) -> Self {
+        if !interactive || !io::stderr().is_terminal() {
+            return Self(None);
+        }
+        // A narrow or short terminal would wrap the frame and make cleanup unsafe.
+        let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+        // SAFETY: size is writable and stderr is an open terminal descriptor.
+        if unsafe { libc::ioctl(io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0
+            || size.ws_col < 40
+            || size.ws_row < ANIMATION_HEIGHT as u16 + 1
+        {
+            return Self(None);
+        }
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let mut stderr = io::stderr().lock();
+            let mut frame = 0;
+            // Delay the first frame so fast cached starts don't flash.
+            while let Err(RecvTimeoutError::Timeout) = rx.recv_timeout(Duration::from_millis(90)) {
+                if frame == 0 {
+                    // Leave the caller's current line untouched. Even when the
+                    // terminal scrolls, the first drawn row is below that line.
+                    let _ = write!(
+                        stderr,
+                        "\r{}\x1b[{}A\r",
+                        "\n".repeat(ANIMATION_HEIGHT),
+                        ANIMATION_HEIGHT - 1
+                    );
+                }
+                let _ = write!(stderr, "{}", animation_frame(frame));
+                let _ = stderr.flush();
+                frame += 1;
+            }
+            if frame > 0 {
+                // Erase every reserved row and return to the first blank line.
+                let mut clear = String::from("\r\x1b[0m");
+                for row in 0..ANIMATION_HEIGHT {
+                    clear.push_str("\x1b[2K");
+                    if row + 1 < ANIMATION_HEIGHT {
+                        clear.push_str("\x1b[1B\r");
+                    }
+                }
+                let _ = write!(clear, "\x1b[{}A\r", ANIMATION_HEIGHT - 1);
+                let _ = stderr.write_all(clear.as_bytes());
+                let _ = stderr.flush();
+            }
+        });
+        Self(Some((tx, handle)))
+    }
+
+    fn stop(&mut self) {
+        if let Some((tx, handle)) = self.0.take() {
+            let _ = tx.send(());
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 struct Plan {
@@ -338,6 +437,7 @@ impl Plan {
 }
 
 pub fn run(invocation: Invocation) -> Result<i32> {
+    let mut spinner = Spinner::start(invocation.command.is_none());
     let options = options::load(&invocation)?;
     let plan = Plan::new(&options)?;
     let runtime = Runtime::detect()?;
@@ -345,6 +445,8 @@ pub fn run(invocation: Invocation) -> Result<i32> {
     if !runtime.exists("image", IMAGE) {
         bail!("image {IMAGE} not found. Run 'nix-container build' to build it.");
     }
+    // Seeding and network creation can print diagnostics; let them own the terminal.
+    spinner.stop();
     runtime.seed_cache(&plan.store, &plan.cache)?;
     for (volume, location) in &plan.persistence {
         runtime.seed_persistence(volume, location)?;

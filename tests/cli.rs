@@ -1,7 +1,8 @@
 #![cfg(unix)]
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    io::Read,
+    os::{fd::FromRawFd, unix::fs::PermissionsExt},
     path::Path,
     process::{Command, Output, Stdio},
 };
@@ -76,6 +77,94 @@ impl Fixture {
 }
 fn pair(args: &[String], flag: &str, value: &str) -> bool {
     args.windows(2).any(|p| p == [flag, value])
+}
+
+#[test]
+fn startup_is_quiet_without_a_terminal() {
+    let f = Fixture::new();
+    let out = f.ok(&[]);
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+    let out = f.ok(&["run", "true"]);
+    assert!(out.stderr.is_empty());
+}
+
+fn with_stderr_pty(
+    command: &mut Command,
+    rows: u16,
+    columns: u16,
+) -> (std::process::ExitStatus, String) {
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: openpty initializes both file descriptors on success.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let size = libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: slave is a terminal descriptor; size contains its new dimensions.
+    assert_eq!(unsafe { libc::ioctl(slave, libc::TIOCSWINSZ, &size) }, 0);
+    // SAFETY: both file descriptors were returned by openpty and are owned here.
+    let mut master = unsafe { fs::File::from_raw_fd(master) };
+    let slave = unsafe { fs::File::from_raw_fd(slave) };
+    let mut child = command
+        .stderr(Stdio::from(slave))
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Command retains its Stdio handle after spawn; close it before reading the PTY.
+    command.stderr(Stdio::null());
+    let status = child.wait().unwrap();
+    let mut output = String::new();
+    // On Linux, reading the master after the last slave closes returns EIO.
+    let _ = master.read_to_string(&mut output);
+    (status, output)
+}
+
+#[test]
+fn spinner_clears_before_container_output_or_error() {
+    let f = Fixture::new();
+    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; exit 0; fi\nif [ \"$1\" = run ]; then echo shell-ready >&2; exit 0; fi\nexit 0\n");
+    let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
+    assert!(status.success(), "{output}");
+    assert!(output.contains("N I X   C O N T A I N E R"), "{output:?}");
+    assert!(output.contains("\x1b[38;5;213m◆"), "{output:?}");
+    assert!(output.contains("starting nix container ..."), "{output:?}");
+    assert!(output.contains("\x1b[1B\r\x1b[2K"), "{output:?}");
+    assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
+
+    f.script(
+        "docker",
+        "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; exit 1; fi\nexit 0\n",
+    );
+    let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
+    assert!(!status.success());
+    assert!(output.contains("✦"), "{output:?}");
+    assert!(
+        output.contains("\x1b[4A\rnix-container: image"),
+        "{output:?}"
+    );
+
+    let (status, output) = with_stderr_pty(&mut f.cmd().args(["run", "true"]), 24, 80);
+    assert!(!status.success());
+    assert!(!output.contains("✦"));
+
+    let (status, output) = with_stderr_pty(&mut f.cmd(), 5, 30);
+    assert!(!status.success());
+    assert!(!output.contains("\x1b["), "{output:?}");
+    assert!(output.contains("nix-container: image"));
 }
 
 #[test]
