@@ -5,6 +5,7 @@ use crate::{
     options::{self, Invocation, Options},
     paths::{self, HOME, PERSIST_ROOT},
     runtime,
+    secrets::{self, SecretHelper},
 };
 use anyhow::{bail, Context, Result};
 use std::{
@@ -151,6 +152,18 @@ impl Plan {
         ];
         let mut credentials = BTreeMap::new();
         let mut op_file = None;
+        // Parse references before launching any helper or touching the runtime.
+        let secrets = options
+            .list("secrets")
+            .iter()
+            .map(|reference| secrets::parse(reference))
+            .collect::<Result<Vec<Box<dyn SecretHelper>>>>()?;
+        let mut slots = HashSet::new();
+        for secret in &secrets {
+            if !slots.insert(secret.slot()) {
+                bail!("secret is already provided: {}", secret.slot());
+            }
+        }
         if let Some(memory) = options.get("memory") {
             if !options::valid_memory(memory) {
                 bail!("--memory: invalid memory size: {memory}");
@@ -161,7 +174,6 @@ impl Plan {
             .iter()
             .map(|p| paths::loopback(p))
             .collect::<Result<Vec<_>>>()?;
-        let aws = options.enabled("with-aws");
         let mut optional_mount = |source: PathBuf, target: &str, readonly: bool| -> Result<()> {
             if source.exists() {
                 if source.to_string_lossy().contains(':') {
@@ -179,16 +191,10 @@ impl Plan {
             }
             Ok(())
         };
-        if options.enabled("with-npmrc") {
-            optional_mount(home.join(".npmrc"), "/home/nix/.npmrc", true)?;
-        }
-        if aws {
-            optional_mount(home.join(".aws/config"), "/home/nix/.aws/config", true)?;
-            optional_mount(
-                home.join(".aws/sso/cache"),
-                "/home/nix/.aws/sso/cache",
-                false,
-            )?;
+        for secret in &secrets {
+            for file in secret.files(&home) {
+                optional_mount(file.source, file.target, file.readonly)?;
+            }
         }
         let mut seen = HashSet::new();
         let mut nix_path = Vec::new();
@@ -262,47 +268,24 @@ impl Plan {
         }
         // Resolve credentials only after validating the plan. Values are passed in the
         // child environment, never in argv and never exported into the caller's shell.
-        if options.enabled("with-gh-token") {
-            let token = runtime::text("gh", &["auth", "token"])
-                .context("failed to get token from 'gh auth token'")?;
-            if token.is_empty() {
-                bail!("failed to get token from 'gh auth token'");
-            }
-            credentials.insert("GH_TOKEN".into(), token);
-            environment.push(Environment::Forward("GH_TOKEN".into()));
-        }
-        if aws {
-            let profile = options.get("aws-profile").filter(|p| !p.is_empty());
-            let mut cmd = Vec::new();
-            if let Some(profile) = profile {
-                cmd.extend(["--profile", profile]);
-            }
-            cmd.extend([
-                "configure",
-                "export-credentials",
-                "--format",
-                "env-no-export",
-            ]);
-            let creds =
-                runtime::text("aws", &cmd).context("--with-aws: could not export credentials")?;
-            if creds.is_empty() {
-                bail!("--with-aws: returned no credentials");
-            }
-            for line in creds.lines().filter(|s| !s.is_empty()) {
-                let (name, value) = line
-                    .split_once('=')
-                    .context("--with-aws: returned malformed credentials")?;
-                if !paths::valid_env(name) {
-                    bail!("--with-aws: invalid environment variable name");
+        for secret in &secrets {
+            for (name, value) in secret.resolve()? {
+                if credentials.contains_key(&name)
+                    || environment
+                        .iter()
+                        .any(|item| matches!(item, Environment::Forward(other) if other == &name))
+                {
+                    bail!("secret variable is already forwarded: {name}");
                 }
-                credentials.insert(name.into(), value.into());
-                environment.push(Environment::Forward(name.into()));
+                credentials.insert(name.clone(), value);
+                environment.push(Environment::Forward(name));
             }
-            if let Some(profile) = profile {
-                credentials.insert("AWS_PROFILE".into(), profile.into());
-                environment.push(Environment::Forward("AWS_PROFILE".into()));
-            } else if env::var_os("AWS_PROFILE").is_some() {
-                environment.push(Environment::Forward("AWS_PROFILE".into()));
+        }
+        for secret in &secrets {
+            for name in secret.inherited_env() {
+                if env::var_os(name).is_some() && !credentials.contains_key(*name) {
+                    environment.push(Environment::Forward((*name).into()));
+                }
             }
         }
         if let Some(file) = options.get("with-env") {

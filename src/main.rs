@@ -7,6 +7,7 @@ mod options;
 mod paths;
 mod run;
 mod runtime;
+mod secrets;
 
 use anyhow::Result;
 
@@ -19,10 +20,8 @@ Run a containerized nix-shell for shell.nix or default.nix in the current direct
 Everything after 'run' is the command; put nix-container options before it.
 
 Options (CLI > nix-container.yml/.yaml > environment):
-  --with-gh-token                  Forward 'gh auth token' as GH_TOKEN
-  --with-aws[=PROFILE]              Forward resolved AWS credentials and config
-  --with-npmrc                     Mount ~/.npmrc read-only
   --with-env FILE                  Load dotenv; resolve op:// references via op run
+  --secret REF                     Provide secret via gh://, npmrc:// or aws:// (repeatable)
   --with-shared-nix-exprs NAME=DIR  Mount shared Nix expressions read-only (repeatable)
   --mount HOST[:CONTAINER][:ro|:rw] Bind an extra host path (repeatable)
   --persist PATH                   Persist a container directory per project (repeatable)

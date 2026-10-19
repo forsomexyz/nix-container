@@ -18,13 +18,7 @@ impl Options {
     pub fn list(&self, key: &str) -> &[String] {
         self.0.get(key).map(Vec::as_slice).unwrap_or_default()
     }
-    pub fn enabled(&self, key: &str) -> bool {
-        self.get(key) == Some("true")
-    }
     pub fn overlay(&mut self, other: Self) {
-        if other.0.contains_key("with-aws") {
-            self.0.remove("aws-profile");
-        }
         self.0.extend(other.0);
     }
 }
@@ -65,29 +59,14 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
                 result.use_config = false;
                 continue;
             }
-            "--with-gh-token" | "--with-npmrc" => {
-                result.options.set(&arg[2..], "true");
-                continue;
-            }
-            "--with-aws" => {
-                result.options.set("with-aws", "true");
-                result.options.0.remove("aws-profile");
-                continue;
-            }
             _ => {}
         }
         let (flag, inline) = arg
             .split_once('=')
             .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
-        if flag == "--with-aws" {
-            result.options.set("with-aws", "true");
-            result
-                .options
-                .set("aws-profile", inline.unwrap_or_default());
-            continue;
-        }
         let (key, multiple, required) = match flag {
             "--with-env" => ("with-env", false, "a file argument"),
+            "--secret" => ("secrets", true, "a secret reference"),
             "--with-shared-nix-exprs" => ("with-shared-nix-exprs", true, "a value (NAME=DIR)"),
             "--mount" => ("mounts", true, "a value (HOST[:CONTAINER][:ro|:rw])"),
             "--persist" => ("persistence", true, "a container path"),
@@ -117,14 +96,6 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
         }
     }
     Ok(result)
-}
-
-pub fn boolean(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" => Some(true),
-        "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 pub fn valid_memory(value: &str) -> bool {
@@ -170,6 +141,7 @@ fn list_key(key: &str) -> Option<&str> {
         "mount" | "mounts" => Some("mounts"),
         "persist" | "persistence" => Some("persistence"),
         "with-shared-nix-exprs" => Some("with-shared-nix-exprs"),
+        "secret" | "secrets" => Some("secrets"),
         _ => None,
     }
 }
@@ -224,22 +196,6 @@ pub fn config(text: &str, file: &Path) -> Result<Options> {
             }
             let value = scalar(raw)?;
             match key.as_str() {
-                "with-gh-token" | "with-npmrc" => {
-                    let b = boolean(&value).context("expected true or false")?;
-                    options.set(&key, b.to_string());
-                }
-                "with-aws" => {
-                    if value.is_empty() {
-                        bail!("'with-aws' expects true, false or a profile name");
-                    }
-                    options.0.remove("aws-profile");
-                    if let Some(enabled) = boolean(&value) {
-                        options.set(&key, enabled.to_string());
-                    } else {
-                        options.set(&key, "true");
-                        options.set("aws-profile", value);
-                    }
-                }
                 "memory" => {
                     if !valid_memory(&value) {
                         bail!("invalid memory size: {value}");
@@ -323,8 +279,11 @@ mod tests {
     }
     #[test]
     fn config_shapes_and_paths() {
-        let o = config("with_gh_token: yes\nwith-aws: dev\nports: [8080, '3000:3000']\nmounts:\n - ../data:ro\nnetwork: dev-network # hi\nwith-env: .env\npersist: .local/share/app", Path::new("/cfg/options.yml")).unwrap();
-        assert!(o.enabled("with-gh-token"));
+        let o = config("secrets: [gh://github.com/alice, aws://profile/dev]\nports: [8080, '3000:3000']\nmounts:\n - ../data:ro\nnetwork: dev-network # hi\nwith-env: .env\npersist: .local/share/app", Path::new("/cfg/options.yml")).unwrap();
+        assert_eq!(
+            o.list("secrets"),
+            ["gh://github.com/alice", "aws://profile/dev"]
+        );
         assert_eq!(o.list("ports"), ["8080", "3000:3000"]);
         assert_eq!(o.get("network"), Some("dev-network")); // trailing comment stripped
         assert_eq!(o.get("mounts"), Some("/cfg/../data:ro"));
@@ -338,11 +297,42 @@ mod tests {
             "unknown: true",
             "ports:\n -",
             "ports: [1,,2]",
-            "with-npmrc: maybe",
+            "with-npmrc: true",
         ] {
             let err = config(text, Path::new("config.yml")).unwrap_err();
             assert!(format!("{err:#}").contains("config.yml:"));
         }
+    }
+    #[test]
+    fn secret_references_are_repeatable_and_override_config() {
+        let mut options = config(
+            "secrets: [gh://github.com/alice, npmrc://default]",
+            Path::new("config.yml"),
+        )
+        .unwrap();
+        assert_eq!(
+            options.list("secrets"),
+            ["gh://github.com/alice", "npmrc://default"]
+        );
+        let invocation = parse(&[
+            "--secret=aws://default".into(),
+            "--secret".into(),
+            "npmrc://default".into(),
+            "run".into(),
+            "true".into(),
+        ])
+        .unwrap();
+        options.overlay(invocation.options);
+        assert_eq!(
+            options.list("secrets"),
+            ["aws://default", "npmrc://default"]
+        );
+        assert!(parse(&["--secret".into(), "".into()]).is_err());
+        assert!(config(
+            "secrets: [gh://github.com/alice,,npmrc://default]",
+            Path::new("config.yml")
+        )
+        .is_err());
     }
     #[test]
     fn command_boundary_and_override() {

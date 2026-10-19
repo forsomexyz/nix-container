@@ -218,18 +218,54 @@ fn termination_signal_reaches_runtime() {
 }
 
 #[test]
-fn aws_cli_resets_config_profile_and_accepts_literal_boolean_profile() {
+fn aws_secret_reference_selects_profile_and_cli_replaces_config_list() {
     let f = Fixture::new();
     f.script("aws", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MOCK_ROOT/aws-argv\"\nprintf 'AWS_ACCESS_KEY_ID=key\\n'\n");
-    fs::write(f.path("project/nix-container.yml"), "with-aws: dev\n").unwrap();
-    f.ok(&["--with-aws", "run", "true"]);
+    fs::write(
+        f.path("project/nix-container.yml"),
+        "secrets: aws://profile/dev\n",
+    )
+    .unwrap();
+    f.ok(&["run", "true"]);
+    assert!(fs::read_to_string(f.path("aws-argv"))
+        .unwrap()
+        .starts_with("--profile\ndev\n"));
+    f.ok(&["--secret", "aws://default", "run", "true"]);
     assert!(!fs::read_to_string(f.path("aws-argv"))
         .unwrap()
         .contains("--profile"));
-    f.ok(&["--with-aws=false", "run", "true"]);
+    f.ok(&["--secret", "aws://profile/false", "run", "true"]);
     assert!(fs::read_to_string(f.path("aws-argv"))
         .unwrap()
         .starts_with("--profile\nfalse\n"));
+}
+
+#[test]
+fn retired_secret_options_are_rejected() {
+    for flag in [
+        "--with-gh-token",
+        "--with-npmrc",
+        "--with-aws",
+        "--with-aws=dev",
+    ] {
+        let f = Fixture::new();
+        let out = f.cmd().args([flag, "run", "true"]).output().unwrap();
+        assert!(!out.status.success(), "accepted {flag}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option"));
+        assert!(f.log().is_empty());
+    }
+    for key in ["with-gh-token", "with-npmrc", "with-aws", "aws-profile"] {
+        let f = Fixture::new();
+        fs::write(
+            f.path("project/nix-container.yml"),
+            format!("{key}: true\n"),
+        )
+        .unwrap();
+        let out = f.cmd().args(["run", "true"]).output().unwrap();
+        assert!(!out.status.success(), "accepted {key}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option"));
+        assert!(f.log().is_empty());
+    }
 }
 
 #[test]
@@ -306,7 +342,8 @@ fn shared_expressions_and_npmrc_are_readonly_and_keep_baked_channel() {
     fs::create_dir(f.path("home/common")).unwrap();
     fs::write(f.path("home/.npmrc"), "registry=https://example.invalid\n").unwrap();
     f.ok(&[
-        "--with-npmrc",
+        "--secret",
+        "npmrc://default",
         "--with-shared-nix-exprs",
         "common=~/common",
         "run",
@@ -361,8 +398,10 @@ fn credentials_are_environment_only_and_op_wraps_launch() {
         let out = f
             .backend(cli)
             .args([
-                "--with-gh-token",
-                "--with-aws=dev",
+                "--secret",
+                "gh://github.com/alice",
+                "--secret",
+                "aws://profile/dev",
                 "--with-env",
                 ".env",
                 "run",
@@ -399,6 +438,151 @@ fn credentials_are_environment_only_and_op_wraps_launch() {
             fs::read_to_string(f.path("credentials")).unwrap(),
             "github-secret|access-secret|secret-key|dev|resolved-secret"
         );
+    }
+}
+
+#[test]
+fn secret_references_deliver_env_and_files_without_runtime_argv_values() {
+    for cli in ["docker", "container"] {
+        let f = Fixture::new();
+        f.script("gh", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MOCK_ROOT/gh-argv\"\nprintf 'github-secret\\n'\n");
+        f.script("aws", "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$MOCK_ROOT/aws-argv\"\nprintf 'AWS_ACCESS_KEY_ID=aws-secret\\n'\n");
+        fs::write(
+            f.path("home/.npmrc"),
+            "//registry.example/:_authToken=npm-secret\n",
+        )
+        .unwrap();
+        fs::write(
+            f.path("project/nix-container.yml"),
+            "secrets: [gh://github.com/alice, npmrc://default]\n",
+        )
+        .unwrap();
+        let out = f
+            .backend(cli)
+            .args([
+                "--secret=gh://github.com/alice",
+                "--secret=gh://github.com/bob",
+                "run",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(!out.status.success()); // Both references deliver GH_TOKEN.
+        assert!(f.log().is_empty()); // Collision detected before any helper or runtime runs.
+                                     // Use config for GH + npmrc; CLI supplies a different secret list on the next run.
+        let out = f.backend(cli).args(["run", "true"]).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(f.path("gh-argv")).unwrap(),
+            "auth\ntoken\n--hostname\ngithub.com\n--user\nalice\n"
+        );
+        assert!(pair(&f.argv(), "-e", "GH_TOKEN"));
+        assert!(pair(
+            &f.argv(),
+            "-v",
+            &format!("{}:/home/nix/.npmrc:ro", f.path("home/.npmrc").display())
+        ));
+        assert_eq!(
+            fs::read_to_string(f.path("credentials")).unwrap(),
+            "github-secret||||"
+        );
+        for run in f.runs() {
+            assert!(!run.join(" ").contains("github-secret"));
+        }
+
+        let out = f
+            .backend(cli)
+            .args(["--secret", "aws://profile/dev", "run", "true"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(f.path("aws-argv")).unwrap(),
+            "--profile\ndev\nconfigure\nexport-credentials\n--format\nenv-no-export\n"
+        );
+        assert!(pair(&f.argv(), "-e", "AWS_ACCESS_KEY_ID"));
+        assert_eq!(
+            fs::read_to_string(f.path("credentials")).unwrap(),
+            "|aws-secret||dev|"
+        );
+        assert!(!f.argv().join(" ").contains("aws-secret"));
+        assert!(!f.argv().iter().any(|s| s.ends_with(":/home/nix/.npmrc:ro")));
+
+        let out = f
+            .backend(cli)
+            .args([
+                "--secret",
+                "gh://github.com/alice",
+                "--secret",
+                "aws://default",
+                "run",
+                "true",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(f.path("credentials")).unwrap(),
+            "github-secret|aws-secret|||"
+        );
+        for name in ["GH_TOKEN", "AWS_ACCESS_KEY_ID"] {
+            assert!(pair(&f.argv(), "-e", name));
+        }
+    }
+}
+
+#[test]
+fn invalid_secret_references_and_collisions_do_not_launch() {
+    for spec in [
+        "gh://github.com",
+        "gh://github.com/alice/extra",
+        "gh://-h/alice",
+        "npmrc://unknown",
+        "aws://profile/-bad",
+        "unknown://x",
+    ] {
+        let f = Fixture::new();
+        let out = f
+            .cmd()
+            .args(["--secret", spec, "run", "true"])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted {spec}");
+        assert!(f.log().is_empty());
+    }
+    let f = Fixture::new();
+    fs::write(f.path("home/.npmrc"), "secret").unwrap();
+    for args in [
+        vec!["--secret", "npmrc://default", "--secret", "npmrc://default"],
+        vec![
+            "--secret",
+            "gh://github.com/alice",
+            "--secret",
+            "gh://github.com/bob",
+        ],
+        vec!["--secret", "aws://default", "--secret", "aws://profile/dev"],
+        vec![
+            "--secret",
+            "npmrc://default",
+            "--mount",
+            ".:/home/nix/.npmrc",
+        ],
+    ] {
+        let out = f.cmd().args(args).args(["run", "true"]).output().unwrap();
+        assert!(!out.status.success());
+        assert!(!f.log().contains("launch"));
     }
 }
 

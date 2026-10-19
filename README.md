@@ -24,8 +24,8 @@ Nix on the host.
   and a guest kernel configured (`container system kernel set --recommended`).
   JSON is parsed directly in Rust; `jq` is not required. See [Using Apple's
   `container`](#using-apples-container).
-- For `--with-gh-token`: the `gh` CLI, authenticated.
-- For `--with-aws`: the `aws` CLI (v2.13+ for `configure export-credentials`).
+- For `gh://` secrets: the `gh` CLI, authenticated.
+- For `aws://` secrets: the `aws` CLI (v2.13+ for `configure export-credentials`).
 - For `--with-env` with 1Password references: the `op` CLI, signed in.
 
 ## Setup
@@ -52,8 +52,9 @@ reinstall the binary before rebuilding the images. The build produces:
 
 ### Migrating from the shell implementation
 
-Existing run flags, flat YAML configuration, environment variables and volume
-names are retained. The management commands are now `nix-container init`,
+Most run flags, flat YAML configuration, environment variables and volume
+names are retained; gh, npmrc and AWS options now use `--secret` references.
+The management commands are now `nix-container init`,
 `nix-container build` and `nix-container clear-cache`. To keep their old hyphenated
 names, optionally source `nix-container.sh` from bash/zsh; it now contains only
 three compatibility wrappers calling the installed binary. Restart your shell
@@ -107,7 +108,7 @@ Everything after `run` is treated as the command (and its arguments), so any
 options must come before it:
 
 ```sh
-nix-container --with-aws run aws s3 ls
+nix-container --secret aws://default run aws s3 ls
 ```
 
 The command executes inside the resolved `nix-shell` environment, its exit
@@ -123,10 +124,7 @@ nix-container run node -e 'console.log(1 + 1)' | cat
 
 | Flag                       | Effect                                                                                          |
 | -------------------------- | ----------------------------------------------------------------------------------------------- |
-| `--with-gh-token`          | Run `gh auth token` on the host and forward the result as `GH_TOKEN`.                           |
-| `--with-aws`               | Export resolved AWS credentials as env vars and read-only mount `~/.aws/config` and SSO cache.  |
-| `--with-aws=<profile>`     | Same as `--with-aws`, but resolves credentials from the given profile (sets `AWS_PROFILE` too). |
-| `--with-npmrc`             | Read-only mount `~/.npmrc` at `/home/nix/.npmrc` if it exists on the host.                      |
+| `--secret <ref>`           | Use a secret reference to provide environment variables or files (repeatable). See [Secret references](#secret-references). |
 | `--with-shared-nix-exprs <name>=<dir>`  | Mount `<dir>` read-only and add it to `NIX_PATH` as `<name>`, so the project's nix files can `import <name>`. Repeatable. See [Sharing Nix expressions across projects](#sharing-nix-expressions-across-projects). |
 | `--mount <spec>`           | Bind-mount an extra host path into the container. `<spec>` is `host[:container][:ro\|:rw]`. Repeatable. See [Mounting extra directories](#mounting-extra-directories). |
 | `--persist <path>`         | Back a container directory with a project-specific named volume. Repeatable. See [Persisting container data](#persisting-container-data). |
@@ -145,9 +143,7 @@ retyped on every run:
 
 ```yaml
 # nix-container.yml
-with-gh-token: true
-with-npmrc: true
-with-aws: dev            # true for the default profile, or a profile name
+secrets: [gh://github.com/alice, npmrc://default, aws://profile/dev]
 with-env: .env           # relative to this file
 with-shared-nix-exprs: common=~/nix-common
 memory: 4G
@@ -166,7 +162,8 @@ persistence:
 With that file in place, a bare `nix-container` behaves like:
 
 ```sh
-nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
+nix-container --secret gh://github.com/alice --secret npmrc://default \
+  --secret aws://profile/dev --with-env .env \
   --with-shared-nix-exprs common=~/nix-common --memory 4G --network dev-network \
   -p 8080 -p 3000:3000 \
   --mount ~/datasets:ro --mount ../shared-lib:/home/nix/shared-lib \
@@ -176,10 +173,9 @@ nix-container --with-gh-token --with-npmrc --with-aws=dev --with-env .env \
 See [Networks](#networks) for what `network` does.
 
 `nix-container.yaml` is accepted as well (`.yml` wins if both exist), and keys
-may be spelled with underscores (`with_gh_token`) instead of dashes. Booleans
-accept `true`/`false`, `yes`/`no` and `on`/`off`. List options such as ports,
-mounts and persistence may also be written inline (`ports: [8080, 3000:3000]`)
-or as a single value (`ports: 8080`). The file is parsed directly in Rust,
+may be spelled with underscores (`with_shared_nix_exprs`) instead of dashes.
+List options such as secrets, ports, mounts and persistence may also be written
+inline (`ports: [8080, 3000:3000]`) or as a single value (`ports: 8080`). The file is parsed directly in Rust,
 so no YAML tooling is needed on the host. Only this flat subset of YAML is
 understood; flow-list items cannot contain commas. Quoted scalars must have a matching delimiter;
 embedded quote escapes are not
@@ -192,11 +188,10 @@ Precedence, highest first:
 2. `nix-container.yml` (or the file given to `--config`).
 3. Environment variables (`NIX_CONTAINER_MEMORY`, `NIX_CONTAINER_SHARED_NIX_EXPRS`).
 
-A flag overrides the corresponding key entirely: `--with-aws` ignores a profile
-set in the file, and passing any `-p` (or `--mount`, `--persist`,
-`--with-shared-nix-exprs`) replaces *all* ports (or mounts, persistence
-locations, or shared expression dirs) from the file rather than adding to
-them. To ignore the file for a single run:
+A flag overrides the corresponding key entirely: passing any `--secret`,
+`-p`, `--mount`, `--persist`, or `--with-shared-nix-exprs` replaces *all*
+references, ports, mounts, persistence locations, or shared expression dirs
+from the file rather than adding to them. To ignore the file for a single run:
 
 ```sh
 nix-container --no-config
@@ -513,11 +508,31 @@ Note: the hash is computed from the file *contents*, so any edit to
 `shell.nix` produces a new cache (and the previous one is left orphaned until
 you clear it with `--all`).
 
+## Secret references
+
+Use repeatable `--secret REF` options, or `secrets:` in `nix-container.yml`.
+The scheme selects a built-in provider; references contain identifiers, not
+secret values:
+
+| Reference | Delivery |
+| --- | --- |
+| `gh://<host>/<account>` | Run `gh auth token --hostname <host> --user <account>` on the host; forward `GH_TOKEN` by name. Both host and account are required. |
+| `npmrc://default` | Mount the host's `~/.npmrc` read-only at `/home/nix/.npmrc`, if present. |
+| `aws://default` | Resolve AWS credentials using the host's default profile and mount AWS config and SSO cache. |
+| `aws://profile/<name>` | As above, selecting the given AWS profile and setting `AWS_PROFILE`. |
+
+For example: `nix-container --secret gh://github.com/alice --secret npmrc://default`.
+A reference with an unknown scheme or invalid shape is rejected. Duplicate
+file mounts or environment names fail rather than silently overwriting another
+secret. Env values stay out of runtime arguments; file references mount host
+files, so secrets remain accessible to processes inside the container.
+`op://` references in `--with-env` files still use `op run` as described below.
+
 ## AWS credentials
 
-`--with-aws` runs the host's full AWS credential resolution chain
-(`aws configure export-credentials`) and forwards the resolved credentials as
-environment variables. It also mounts:
+The `aws://default` and `aws://profile/<name>` references run the host's full
+AWS credential resolution chain (`aws configure export-credentials`) and forward
+the resolved credentials as environment variables. They also mount:
 
 - `~/.aws/config` — so `aws --profile <name>` calls inside the container can
   read profile definitions.
