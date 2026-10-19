@@ -12,12 +12,18 @@ pub fn hash(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))[..8].into()
 }
 
-pub fn project_hash() -> Result<String> {
-    let file = ["shell.nix", "default.nix"]
+/// The expression nix-shell would select in the current directory, in its
+/// precedence order. The container's workdir is the project, so the bare name
+/// is also a valid relative path inside the session.
+pub fn shell_file() -> Result<&'static str> {
+    ["shell.nix", "default.nix"]
         .into_iter()
         .find(|f| Path::new(f).is_file())
-        .context("no shell.nix or default.nix in current directory")?;
-    Ok(hash(fs::read(file)?))
+        .context("no shell.nix or default.nix in current directory")
+}
+
+pub fn project_hash() -> Result<String> {
+    Ok(hash(fs::read(shell_file()?)?))
 }
 
 pub fn host_path(value: &str, home: &Path) -> PathBuf {
