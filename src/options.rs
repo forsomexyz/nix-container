@@ -29,6 +29,7 @@ pub struct Invocation {
     pub config: Option<String>,
     pub use_config: bool,
     pub help: bool,
+    pub verbose: bool,
 }
 
 pub fn parse(args: &[String]) -> Result<Invocation> {
@@ -38,6 +39,7 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
         config: None,
         use_config: true,
         help: false,
+        verbose: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -57,6 +59,10 @@ pub fn parse(args: &[String]) -> Result<Invocation> {
             }
             "--no-config" => {
                 result.use_config = false;
+                continue;
+            }
+            "-v" | "--verbose" => {
+                result.verbose = true;
                 continue;
             }
             _ => {}

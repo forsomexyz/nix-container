@@ -12,7 +12,7 @@ use std::{
     ffi::{OsStr, OsString},
     fs,
     path::PathBuf,
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
 };
 
 pub(super) struct Cli(pub PathBuf);
@@ -47,6 +47,26 @@ impl Cli {
             bail!(
                 "container runtime {} failed (exit {code})",
                 args.first().unwrap_or(&"command")
+            );
+        }
+        Ok(())
+    }
+
+    /// `checked`, but without letting the child draw on the terminal. Used for
+    /// preparation steps that may run while the startup animation is on screen;
+    /// their output is only interesting when they fail, or when the user asked
+    /// to see the whole startup.
+    pub fn quiet(&self, args: &[&str]) -> Result<()> {
+        if runtime::verbose() {
+            return self.checked(args);
+        }
+        let out = self.output(args)?;
+        if !out.status.success() {
+            bail!(
+                "container runtime {} failed (exit {}): {}",
+                args.first().unwrap_or(&"command"),
+                runtime::code(out.status),
+                String::from_utf8_lossy(&out.stderr).trim()
             );
         }
         Ok(())
@@ -125,11 +145,7 @@ impl Cli {
         if exists()? {
             return Ok(());
         }
-        let created = runtime::wait(
-            self.process()
-                .args(["network", "create", network])
-                .stdout(Stdio::null()),
-        )? == 0;
+        let created = self.quiet(&["network", "create", network]).is_ok();
         if !created && !exists()? {
             bail!("could not create network: {network}");
         }
@@ -145,7 +161,7 @@ impl Cli {
             // Never delete a failed seed: it may contain data or have been
             // created concurrently. Existence remains the legacy readiness
             // check; this is not a transactional initialization protocol.
-            self.checked(&[
+            self.quiet(&[
                 "run",
                 "--rm",
                 "--user",

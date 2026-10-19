@@ -30,6 +30,7 @@ Options (CLI > nix-container.yml/.yaml > environment):
   --network NAME                   Join a named network or runtime network mode
   --config FILE                    Use this config instead of the discovered file
   --no-config                      Ignore the project config
+  -v, --verbose                    Show all startup output instead of the animation
   -h, --help                       Show help
   --version                        Show version
 

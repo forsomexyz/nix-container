@@ -24,7 +24,7 @@ impl AppleBackend {
         }
         // Staging mounts leave the image's /nix visible as the copy source.
         // Run as root, preserving store metadata and owning only the cache root.
-        self.0.checked(&[
+        self.0.quiet(&[
             "run", "--rm", "--user", "0", "--entrypoint", "sh",
             "-v", &format!("{}:/seed-nix", plan.store),
             "-v", &format!("{}:/seed-cache", plan.cache), &plan.image, "-c",

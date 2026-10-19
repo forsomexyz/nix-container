@@ -184,6 +184,74 @@ fn spinner_clears_before_container_output_or_error() {
 }
 
 #[test]
+fn warm_up_resolves_dependencies_without_running_the_shell_hook() {
+    // The default mock runtime is silent on `run` and records every launch.
+    let f = Fixture::new();
+    let (status, _) = with_stderr_pty(&mut f.cmd(), 24, 80);
+    assert!(status.success());
+    let runs = f.runs();
+    assert_eq!(runs.len(), 2, "warm-up then session: {runs:?}");
+
+    let (warm, session) = (&runs[0], &runs[1]);
+    // The warm-up resolves the closure without a shell and without the hook.
+    let expression = warm.iter().position(|a| a == "-E").map(|i| &warm[i + 1]);
+    let expression = expression.expect("warm-up passes an expression");
+    assert!(expression.contains("shellHook = \"\""), "{expression}");
+    assert!(expression.contains("import ./shell.nix"), "{expression}");
+    assert!(expression.contains("builtins.isFunction"), "{expression}");
+    assert!(expression.contains("overrideAttrs"), "{expression}");
+    assert!(warm.windows(2).any(|p| p == ["--run", "true"]), "{warm:?}");
+    // Never a TTY, or nix would draw over the frame with control sequences.
+    assert!(!warm.iter().any(|a| a == "-it" || a == "-t"), "{warm:?}");
+
+    // The real session is untouched: interactive, no expression override.
+    assert!(session.iter().any(|a| a == "-it"), "{session:?}");
+    assert!(!session.iter().any(|a| a == "-E"), "{session:?}");
+    assert!(
+        !session.iter().any(|a| a.contains("shellHook")),
+        "{session:?}"
+    );
+
+    // Without a terminal there is no animation to cover, so no second container.
+    let f = Fixture::new();
+    f.ok(&[]);
+    assert_eq!(f.runs().len(), 1, "no warm-up without a terminal");
+}
+
+#[test]
+fn verbose_shows_startup_output_instead_of_the_animation() {
+    // Distinguish the two launches: only the warm-up carries an expression.
+    // The sleep outlasts the animation's startup delay, so a frame is drawn.
+    let chatty = "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; echo image-id; exit 0; fi\nif [ \"$1\" = run ]; then\n  case \"$*\" in *-E*) echo building-dependencies >&2 ;; *) echo shell-ready >&2 ;; esac\n  exit 0\nfi\nexit 0\n";
+
+    // A cold build stays behind the animation: the frame survives to the session.
+    let f = Fixture::new();
+    f.script("docker", chatty);
+    let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
+    assert!(status.success(), "{output}");
+    assert!(output.contains("N I X   C O N T A I N E R"), "{output:?}");
+    assert!(!output.contains("building-dependencies"), "{output:?}");
+    assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
+
+    // --verbose trades the animation for everything it would have hidden.
+    let f = Fixture::new();
+    f.script("docker", chatty);
+    let (status, output) = with_stderr_pty(f.cmd().arg("--verbose"), 24, 80);
+    assert!(status.success(), "{output}");
+    assert!(output.contains("building-dependencies"), "{output:?}");
+    assert!(output.contains("shell-ready"), "{output:?}");
+    assert!(!output.contains("\x1b["), "no animation: {output:?}");
+
+    // The warm-up still runs under --verbose: debugging must see the real path.
+    let f = Fixture::new();
+    let (status, _) = with_stderr_pty(f.cmd().arg("-v"), 24, 80);
+    assert!(status.success());
+    let runs = f.runs();
+    assert_eq!(runs.len(), 2, "warm-up then session: {runs:?}");
+    assert!(runs[0].iter().any(|a| a == "-E"), "{runs:?}");
+}
+
+#[test]
 fn termination_signal_reaches_runtime() {
     let f = Fixture::new();
     f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then echo image-id; exit 0; fi\ntrap 'exit 143' TERM\ntouch \"$MOCK_ROOT/ready\"\nwhile :; do sleep 0.05; done\n");

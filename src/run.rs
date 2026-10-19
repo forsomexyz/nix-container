@@ -102,6 +102,10 @@ impl Spinner {
         Self(Some((tx, handle)))
     }
 
+    fn active(&self) -> bool {
+        self.0.is_some()
+    }
+
     fn stop(&mut self) {
         if let Some((tx, handle)) = self.0.take() {
             let _ = tx.send(());
@@ -343,6 +347,42 @@ impl Plan {
     }
 }
 
+/// Build the project's shell derivation with an emptied `shellHook`.
+///
+/// nix-shell runs `shellHook` even under `--run`, so warming the dependency
+/// closure with a plain `--run true` would run the user's hook twice per
+/// session. Overriding the attribute changes the shell derivation's own hash
+/// but not its `inputDrvs`, which is what actually gets built, so the warm-up
+/// realizes exactly the closure the real session then reuses from the shared
+/// store volume. Both guards matter: the file may evaluate to a derivation
+/// rather than a function, and a bare `derivation {}` has no `overrideAttrs`.
+fn warm_expression(file: &str) -> String {
+    format!(
+        "let f = import ./{file}; \
+           d = if builtins.isFunction f then f {{}} else f; \
+         in if d ? overrideAttrs then d.overrideAttrs (_: {{ shellHook = \"\"; }}) else d"
+    )
+}
+
+/// Realize the dependency closure without opening a shell, so the animation can
+/// cover the slow part of startup. Never a TTY: under --verbose nix then emits
+/// plain lines rather than redrawing a progress display over the session's own
+/// output.
+fn warm_invocation(file: &str) -> RunInvocation {
+    RunInvocation {
+        args: vec![
+            "--extra-experimental-features".into(),
+            "flakes".into(),
+            "-E".into(),
+            warm_expression(file),
+            "--run".into(),
+            "true".into(),
+        ],
+        attach_stdin: false,
+        tty: false,
+    }
+}
+
 fn shell_invocation(command: Option<&[String]>, terminal: bool) -> RunInvocation {
     let mut args = vec!["--extra-experimental-features".into(), "flakes".into()];
     if let Some(command) = command {
@@ -364,7 +404,9 @@ fn shell_invocation(command: Option<&[String]>, terminal: bool) -> RunInvocation
 }
 
 pub fn run(invocation: Invocation) -> Result<i32> {
-    let mut spinner = Spinner::start(invocation.command.is_none());
+    runtime::set_verbose(invocation.verbose);
+    // --verbose replaces the animation with the output it would have hidden.
+    let mut spinner = Spinner::start(invocation.command.is_none() && !invocation.verbose);
     let options = options::load(&invocation)?;
     let plan = Plan::new(&options)?;
     let backend = backend::detect()?;
@@ -372,9 +414,27 @@ pub fn run(invocation: Invocation) -> Result<i32> {
     if backend.image_id(IMAGE)?.is_none() {
         bail!("image {IMAGE} not found. Run 'nix-container build' to build it.");
     }
-    // Seeding and network creation can print diagnostics; let them own the terminal.
-    spinner.stop();
     let prepared = backend.prepare_run(&plan.run)?;
+    // Keep the animation up through dependency resolution, so it ends when the
+    // shell is actually ready rather than when the container is merely started.
+    // A cold build can take minutes and stays behind the animation; --verbose
+    // is the way to watch it. Worth a second container only when there is an
+    // animation to cover or output to show; a failure here is not reported,
+    // since the real session reports it in context.
+    if spinner.active() || invocation.verbose {
+        if let Ok(file) = paths::shell_file() {
+            if let Ok(warm) = backend.command(&prepared, &warm_invocation(file)) {
+                let mut command = warm.launch(&plan.credentials, plan.op_file.as_deref());
+                command.stdin(Stdio::null());
+                if !invocation.verbose {
+                    // Nothing may reach the terminal while a frame is drawn.
+                    command.stdout(Stdio::null()).stderr(Stdio::null());
+                }
+                let _ = runtime::wait(&mut command);
+            }
+        }
+    }
+    spinner.stop();
     let session = shell_invocation(invocation.command.as_deref(), true);
     let command = backend.command(&prepared, &session)?;
     let start = Instant::now();

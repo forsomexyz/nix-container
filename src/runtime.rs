@@ -11,7 +11,10 @@ use std::{
     os::unix::{fs::PermissionsExt, process::ExitStatusExt},
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 
@@ -91,6 +94,22 @@ pub fn install_signals() -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// Process-wide output policy, set once before any container work begins.
+/// Like the signal handler above this is genuinely per-process: preparation
+/// runs deep inside the backends, which have no terminal-facing API of their
+/// own and must not grow one just to carry this flag.
+static VERBOSE: AtomicBool = AtomicBool::new(false);
+
+pub fn set_verbose(verbose: bool) {
+    VERBOSE.store(verbose, Ordering::Relaxed);
+}
+
+/// When set, steps that are normally silent print instead, so a slow or failing
+/// startup can be watched as it happens.
+pub fn verbose() -> bool {
+    VERBOSE.load(Ordering::Relaxed)
 }
 
 pub fn wait(command: &mut Command) -> Result<i32> {

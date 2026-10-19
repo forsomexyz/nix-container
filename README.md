@@ -91,8 +91,29 @@ The current directory is bind-mounted to `/home/nix/<dirname>` and set as the
 working directory inside the container. The entrypoint is `nix-shell`, so the
 container drops you into the project's resolved environment. On a terminal,
 `nix-container` shows a short, five-line animated splash during startup, clearing
-it before the shell takes over. Small terminals, redirected output, and
+it before the shell takes over. The splash stays up while dependencies are
+resolved, so it ends when the shell is ready rather than when the container
+starts. A cold cache stays behind the splash too, however long it takes; use
+`--verbose` to watch it. Small terminals, redirected output, and
 `nix-container run ...` stay quiet.
+
+To resolve dependencies without opening a shell first, the splash path builds
+the project's expression with an emptied `shellHook`. This keeps the hook from
+running twice per session; it does not change which dependencies are built, so
+anything the hook itself builds is still resolved later, in the real shell.
+
+### Watching startup
+
+When startup is slow or fails, `--verbose` (`-v`) replaces the splash with
+everything it would have hidden — volume seeding, network creation, and the full
+nix build log:
+
+```sh
+nix-container --verbose
+```
+
+This takes the same path as a normal start, so what you see is what a silent
+startup is doing.
 Other host directories can be added with [`--mount`](#mounting-extra-directories).
 
 ### Running a command and exiting
