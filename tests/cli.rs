@@ -157,12 +157,21 @@ fn spinner_clears_before_container_output_or_error() {
     assert!(status.success(), "{output}");
     assert!(output.contains("NIX-CONTAINER"), "{output:?}");
     assert!(output.contains("\x1b[38;5;201m// BOOT"), "{output:?}");
-    assert!(output.contains("\x1b[38;5;51m+["), "{output:?}");
+    assert!(
+        output.contains("\r\x1b[0m\x1b[2K  \x1b[48;5;232m\x1b[38;5;51m+["),
+        "{output:?}"
+    );
     assert!(output.contains("HEX //"), "{output:?}");
     assert!(output.contains("LINK"), "{output:?}");
     assert!(output.contains("initializing environment..."), "{output:?}");
     assert!(output.contains("\x1b[1B\r\x1b[2K"), "{output:?}");
-    assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
+    // Clear with the terminal's default background before handing off to the shell.
+    let clear =
+        "\r\x1b[0m\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[1B\r\x1b[2K\x1b[4A\r";
+    assert!(
+        output.contains(&format!("{clear}shell-ready")),
+        "{output:?}"
+    );
 
     f.script(
         "docker",
@@ -172,7 +181,7 @@ fn spinner_clears_before_container_output_or_error() {
     assert!(!status.success());
     assert!(output.contains("NIX-CONTAINER"), "{output:?}");
     assert!(
-        output.contains("\x1b[4A\rnix-container: image"),
+        output.contains(&format!("{clear}nix-container: image")),
         "{output:?}"
     );
 

@@ -91,9 +91,10 @@ The current directory is bind-mounted to `/home/nix/<dirname>` and set as the
 working directory inside the container. The entrypoint is `nix-shell`, so the
 container drops you into the project's resolved environment. On a terminal,
 `nix-container` shows a five-line cyberpunk boot panel during startup, with neon
-cyan/magenta hex data, glitch accents, and a sweeping uplink scanner. The scanner
-loops rather than reporting build progress, and the panel clears before the
-shell takes over. The splash stays up while dependencies are
+cyan/magenta hex data, glitch accents, and a sweeping uplink scanner. A dark
+background confined to the panel keeps it readable on light and dark terminals.
+The scanner loops rather than reporting build progress, and the panel clears
+before the shell takes over. The splash stays up while dependencies are
 resolved, so it ends when the shell is ready rather than when the container
 starts. A cold cache stays behind the splash too, however long it takes; use
 `--verbose` to watch it. Small terminals, redirected output, and

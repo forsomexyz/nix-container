@@ -27,6 +27,7 @@ const ANIMATION_MIN_COLUMNS: u16 = 40;
 const STREAM_WIDTH: usize = 24;
 
 fn animation_frame(frame: usize) -> String {
+    const BACKGROUND: &str = "\x1b[48;5;232m";
     const CYAN: &str = "\x1b[38;5;51m";
     const MAGENTA: &str = "\x1b[38;5;201m";
     const WHITE: &str = "\x1b[38;5;255m";
@@ -34,11 +35,13 @@ fn animation_frame(frame: usize) -> String {
     const RESET: &str = "\x1b[0m";
     const HEX: &[u8] = b"0123456789ABCDEF";
 
+    // Pair the neon foregrounds with a fixed dark background, even on light terminals.
+    // Reset before erasing and after each border so the background stays inside the panel.
     // Single-column ASCII keeps the panel safe on the same small terminals as before.
     let mut screen = format!(
-        "\r\x1b[2K  {CYAN}+[ {WHITE}NIX-CONTAINER {MAGENTA}// BOOT{CYAN} ]---------+{RESET}"
+        "\r{RESET}\x1b[2K  {BACKGROUND}{CYAN}+[ {WHITE}NIX-CONTAINER {MAGENTA}// BOOT{CYAN} ]---------+{RESET}"
     );
-    let _ = write!(screen, "\x1b[1B\r\x1b[2K  {CYAN}| {DIM}HEX // ");
+    let _ = write!(screen, "\x1b[1B\r\x1b[2K  {BACKGROUND}{CYAN}| {DIM}HEX // ");
     for column in 0..STREAM_WIDTH {
         let distance = (frame % STREAM_WIDTH + STREAM_WIDTH - column) % STREAM_WIDTH;
         let glitch = (frame % 37 + column * 3) % 37 == 0;
@@ -63,7 +66,10 @@ fn animation_frame(frame: usize) -> String {
     // A looping scanner, not a progress bar: dependency resolution has no fixed duration.
     let sweep = frame % (STREAM_WIDTH * 2 - 2);
     let head = sweep.min(STREAM_WIDTH * 2 - 2 - sweep);
-    let _ = write!(screen, "\x1b[1B\r\x1b[2K  {CYAN}| {MAGENTA}LINK {CYAN}[");
+    let _ = write!(
+        screen,
+        "\x1b[1B\r\x1b[2K  {BACKGROUND}{CYAN}| {MAGENTA}LINK {CYAN}["
+    );
     for column in 0..STREAM_WIDTH {
         let (glyph, color) = match column.abs_diff(head) {
             0 => ('#', WHITE),
@@ -77,8 +83,8 @@ fn animation_frame(frame: usize) -> String {
     let cursor = if (frame / 6) % 2 == 0 { '_' } else { ' ' };
     let _ = write!(
         screen,
-        "\x1b[1B\r\x1b[2K  {CYAN}| {MAGENTA}>{cursor} {WHITE}initializing environment...{CYAN}   |{RESET}\
-         \x1b[1B\r\x1b[2K  {CYAN}+----------------------------------+{RESET}\
+        "\x1b[1B\r\x1b[2K  {BACKGROUND}{CYAN}| {MAGENTA}>{cursor} {WHITE}initializing environment...{CYAN}   |{RESET}\
+         \x1b[1B\r\x1b[2K  {BACKGROUND}{CYAN}+----------------------------------+{RESET}\
          \x1b[{}A\r",
         ANIMATION_HEIGHT - 1
     );
@@ -551,6 +557,34 @@ mod tests {
             }
             assert!(rows[0].contains("NIX-CONTAINER // BOOT"));
             assert!(rows[3].contains("initializing environment..."));
+        }
+    }
+
+    #[test]
+    fn animation_background_is_confined_to_the_panel() {
+        for frame in (0..512).chain([usize::MAX]) {
+            let screen = animation_frame(frame);
+            assert!(
+                screen.starts_with("\r\x1b[0m"),
+                "reset before the first erase"
+            );
+            for row in screen.split("\x1b[1B\r") {
+                let (margin, panel) = row
+                    .split_once("\x1b[48;5;232m")
+                    .expect("every row sets a dark background");
+                assert!(
+                    margin.ends_with("\x1b[2K  "),
+                    "erase and indent before coloring"
+                );
+                let (panel, after) = panel
+                    .split_once("\x1b[0m")
+                    .expect("restore terminal colors after each row");
+                // Foreground changes must not reset the background within the panel.
+                for control in panel.split("\x1b[").skip(1) {
+                    assert!(control.starts_with("38;5;"), "foreground only: {control:?}");
+                }
+                assert!(after.is_empty() || after == format!("\x1b[{}A\r", ANIMATION_HEIGHT - 1));
+            }
         }
     }
 
