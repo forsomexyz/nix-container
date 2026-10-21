@@ -155,9 +155,12 @@ fn spinner_clears_before_container_output_or_error() {
     f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; echo image-id; exit 0; fi\nif [ \"$1\" = run ]; then echo shell-ready >&2; exit 0; fi\nexit 0\n");
     let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
     assert!(status.success(), "{output}");
-    assert!(output.contains("N I X   C O N T A I N E R"), "{output:?}");
-    assert!(output.contains("\x1b[38;5;213m◆"), "{output:?}");
-    assert!(output.contains("starting nix container ..."), "{output:?}");
+    assert!(output.contains("NIX-CONTAINER"), "{output:?}");
+    assert!(output.contains("\x1b[38;5;201m// BOOT"), "{output:?}");
+    assert!(output.contains("\x1b[38;5;51m+["), "{output:?}");
+    assert!(output.contains("HEX //"), "{output:?}");
+    assert!(output.contains("LINK"), "{output:?}");
+    assert!(output.contains("initializing environment..."), "{output:?}");
     assert!(output.contains("\x1b[1B\r\x1b[2K"), "{output:?}");
     assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
 
@@ -167,7 +170,7 @@ fn spinner_clears_before_container_output_or_error() {
     );
     let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
     assert!(!status.success());
-    assert!(output.contains("✦"), "{output:?}");
+    assert!(output.contains("NIX-CONTAINER"), "{output:?}");
     assert!(
         output.contains("\x1b[4A\rnix-container: image"),
         "{output:?}"
@@ -175,12 +178,24 @@ fn spinner_clears_before_container_output_or_error() {
 
     let (status, output) = with_stderr_pty(f.cmd().args(["run", "true"]), 24, 80);
     assert!(!status.success());
-    assert!(!output.contains("✦"));
-
-    let (status, output) = with_stderr_pty(&mut f.cmd(), 5, 30);
-    assert!(!status.success());
     assert!(!output.contains("\x1b["), "{output:?}");
-    assert!(output.contains("nix-container: image"));
+
+    for (rows, columns) in [(5, 80), (24, 39)] {
+        let (status, output) = with_stderr_pty(&mut f.cmd(), rows, columns);
+        assert!(!status.success());
+        assert!(!output.contains("\x1b["), "{output:?}");
+        assert!(output.contains("nix-container: image"));
+    }
+}
+
+#[test]
+fn spinner_fits_the_smallest_supported_terminal() {
+    let f = Fixture::new();
+    f.script("docker", "#!/bin/sh\nif [ \"$1\" = image ]; then sleep 0.4; echo image-id; exit 0; fi\nif [ \"$1\" = run ]; then echo shell-ready >&2; exit 0; fi\nexit 0\n");
+    let (status, output) = with_stderr_pty(&mut f.cmd(), 6, 40);
+    assert!(status.success(), "{output}");
+    assert!(output.contains("NIX-CONTAINER"), "{output:?}");
+    assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
 }
 
 #[test]
@@ -229,7 +244,7 @@ fn verbose_shows_startup_output_instead_of_the_animation() {
     f.script("docker", chatty);
     let (status, output) = with_stderr_pty(&mut f.cmd(), 24, 80);
     assert!(status.success(), "{output}");
-    assert!(output.contains("N I X   C O N T A I N E R"), "{output:?}");
+    assert!(output.contains("NIX-CONTAINER"), "{output:?}");
     assert!(!output.contains("building-dependencies"), "{output:?}");
     assert!(output.contains("\x1b[4A\rshell-ready"), "{output:?}");
 

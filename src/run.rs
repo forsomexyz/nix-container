@@ -23,28 +23,65 @@ use std::{
 };
 
 const ANIMATION_HEIGHT: usize = 5;
-const TRAIL_WIDTH: usize = 24;
+const ANIMATION_MIN_COLUMNS: u16 = 40;
+const STREAM_WIDTH: usize = 24;
 
 fn animation_frame(frame: usize) -> String {
-    let mut screen = String::from("\r\x1b[2K  \x1b[1;38;5;213m✦\x1b[0m  N I X   C O N T A I N E R");
-    for row in 0..3 {
-        screen.push_str("\x1b[1B\r\x1b[2K  ");
-        let head = (frame + row * 7) % TRAIL_WIDTH;
-        for column in 0..TRAIL_WIDTH {
-            let distance = (head + TRAIL_WIDTH - column) % TRAIL_WIDTH;
-            let (glyph, color) = match distance {
-                0 => ("◆", 213),
-                1 => ("▓", 177),
-                2 => ("▒", 141),
-                3 => ("░", 105),
-                _ => ("·", 60),
-            };
-            let _ = write!(screen, "\x1b[38;5;{color}m{glyph}");
-        }
-        screen.push_str("\x1b[0m");
+    const CYAN: &str = "\x1b[38;5;51m";
+    const MAGENTA: &str = "\x1b[38;5;201m";
+    const WHITE: &str = "\x1b[38;5;255m";
+    const DIM: &str = "\x1b[38;5;30m";
+    const RESET: &str = "\x1b[0m";
+    const HEX: &[u8] = b"0123456789ABCDEF";
+
+    // Single-column ASCII keeps the panel safe on the same small terminals as before.
+    let mut screen = format!(
+        "\r\x1b[2K  {CYAN}+[ {WHITE}NIX-CONTAINER {MAGENTA}// BOOT{CYAN} ]---------+{RESET}"
+    );
+    let _ = write!(screen, "\x1b[1B\r\x1b[2K  {CYAN}| {DIM}HEX // ");
+    for column in 0..STREAM_WIDTH {
+        let distance = (frame % STREAM_WIDTH + STREAM_WIDTH - column) % STREAM_WIDTH;
+        let glitch = (frame % 37 + column * 3) % 37 == 0;
+        let glyph = if glitch {
+            '/'
+        } else {
+            HEX[(frame / 2 + column * 7) % HEX.len()] as char
+        };
+        let color = if glitch {
+            MAGENTA
+        } else {
+            match distance {
+                0 => WHITE,
+                1..=4 => CYAN,
+                _ => DIM,
+            }
+        };
+        let _ = write!(screen, "{color}{glyph}");
     }
-    screen.push_str("\x1b[1B\r\x1b[2K  starting nix container ...");
-    let _ = write!(screen, "\x1b[{}A\r", ANIMATION_HEIGHT - 1);
+    let _ = write!(screen, "{CYAN}  |{RESET}");
+
+    // A looping scanner, not a progress bar: dependency resolution has no fixed duration.
+    let sweep = frame % (STREAM_WIDTH * 2 - 2);
+    let head = sweep.min(STREAM_WIDTH * 2 - 2 - sweep);
+    let _ = write!(screen, "\x1b[1B\r\x1b[2K  {CYAN}| {MAGENTA}LINK {CYAN}[");
+    for column in 0..STREAM_WIDTH {
+        let (glyph, color) = match column.abs_diff(head) {
+            0 => ('#', WHITE),
+            1 => ('=', MAGENTA),
+            2 => ('-', MAGENTA),
+            _ => ('.', DIM),
+        };
+        let _ = write!(screen, "{color}{glyph}");
+    }
+    let _ = write!(screen, "{CYAN}]  |{RESET}");
+    let cursor = if (frame / 6) % 2 == 0 { '_' } else { ' ' };
+    let _ = write!(
+        screen,
+        "\x1b[1B\r\x1b[2K  {CYAN}| {MAGENTA}>{cursor} {WHITE}initializing environment...{CYAN}   |{RESET}\
+         \x1b[1B\r\x1b[2K  {CYAN}+----------------------------------+{RESET}\
+         \x1b[{}A\r",
+        ANIMATION_HEIGHT - 1
+    );
     screen
 }
 
@@ -60,7 +97,7 @@ impl Spinner {
         let mut size: libc::winsize = unsafe { std::mem::zeroed() };
         // SAFETY: size is writable and stderr is an open terminal descriptor.
         if unsafe { libc::ioctl(io::stderr().as_raw_fd(), libc::TIOCGWINSZ, &mut size) } != 0
-            || size.ws_col < 40
+            || size.ws_col < ANIMATION_MIN_COLUMNS
             || size.ws_row < ANIMATION_HEIGHT as u16 + 1
         {
             return Self(None);
@@ -470,4 +507,68 @@ pub fn run(invocation: Invocation) -> Result<i32> {
         }
     }
     Ok(code)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn visible_rows(screen: &str) -> Vec<String> {
+        screen
+            .split("\x1b[1B\r")
+            .map(|row| {
+                let mut visible = String::new();
+                let mut chars = row.chars();
+                while let Some(ch) = chars.next() {
+                    if ch == '\x1b' {
+                        assert_eq!(chars.next(), Some('['));
+                        for control in chars.by_ref() {
+                            if control.is_ascii_alphabetic() {
+                                break;
+                            }
+                        }
+                    } else if ch != '\r' {
+                        visible.push(ch);
+                    }
+                }
+                visible
+            })
+            .collect()
+    }
+
+    #[test]
+    fn animation_frames_fit_reserved_rows_and_reset_the_cursor() {
+        for frame in (0..512).chain([usize::MAX]) {
+            let screen = animation_frame(frame);
+            assert_eq!(screen.matches("\x1b[2K").count(), ANIMATION_HEIGHT);
+            assert!(screen.ends_with(&format!("\x1b[0m\x1b[{}A\r", ANIMATION_HEIGHT - 1)));
+            let rows = visible_rows(&screen);
+            assert_eq!(rows.len(), ANIMATION_HEIGHT);
+            for row in &rows {
+                assert!(row.is_ascii(), "single-column glyphs: {row:?}");
+                assert_eq!(row.len(), 38, "fixed panel width: {row:?}");
+                assert!(row.len() < usize::from(ANIMATION_MIN_COLUMNS));
+            }
+            assert!(rows[0].contains("NIX-CONTAINER // BOOT"));
+            assert!(rows[3].contains("initializing environment..."));
+        }
+    }
+
+    #[test]
+    fn animation_scanner_bounces_while_data_and_cursor_animate() {
+        let first = visible_rows(&animation_frame(0));
+        let next = visible_rows(&animation_frame(1));
+        let edge = visible_rows(&animation_frame(STREAM_WIDTH - 1));
+        let back = visible_rows(&animation_frame(STREAM_WIDTH));
+        let looped = visible_rows(&animation_frame(STREAM_WIDTH * 2 - 2));
+        let head = |rows: &[String]| rows[2].find('#').unwrap();
+        assert_eq!(head(&next), head(&first) + 1);
+        assert_eq!(head(&edge), head(&first) + STREAM_WIDTH - 1);
+        assert_eq!(head(&back), head(&edge) - 1);
+        assert_eq!(first[2], looped[2]);
+        assert_ne!(first[1], next[1], "hex data changes between frames");
+        assert!(first[3].contains(">_"));
+        assert!(visible_rows(&animation_frame(6))[3].contains("> "));
+        assert_eq!(first[0], next[0], "branding stays readable");
+    }
 }
